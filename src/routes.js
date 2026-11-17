@@ -1457,11 +1457,16 @@ export function buildRecordsRouter({
       const date = todayIso()
       const settings = await loadSettings(Settings)
 
-      const [teacher, records, entryDoc, latestMessage, busRoutes] = await Promise.all([
-        teacherOf(grade, section),
+      // The "class leader message" block is the teacher's own message. Admin
+      // broadcasts also land in LeaderMessage, so they must not be mistaken for
+      // the teacher's message or satisfy the close check.
+      const teacher = await teacherOf(grade, section)
+      const [records, entryDoc, latestMessage, busRoutes] = await Promise.all([
         DailyRecord.find({ date, grade, section }).lean(),
         EntrySection.findOne({ date, grade, section }).lean(),
-        LeaderMessage.findOne({ date, grade, section }).sort({ sentAt: -1 }).lean(),
+        LeaderMessage.findOne({ date, grade, section, sender: teacher })
+          .sort({ sentAt: -1 })
+          .lean(),
         BusLog.find({ date }).lean(),
       ])
 
@@ -1649,7 +1654,12 @@ export function buildRecordsRouter({
   router.post(
     '/teacher/exit/:rollNo/acknowledge',
     api(async (req, res) => {
-      const { day, rollNo, grade, section } = await findTeacherRecord(req, { restrictionType: 'exit' })
+      const { record, day, rollNo, grade, section } = await findTeacherRecord(req, {
+        restrictionType: 'exit',
+      })
+      if (record.resolutionStatus === 'resolved') {
+        throw httpError(400, 'This exit restriction is already resolved for today.')
+      }
       const teacher = await teacherOf(grade, section)
       await DailyRecord.updateOne(
         { date: day, rollNo, restrictionType: 'exit' },
@@ -1669,7 +1679,10 @@ export function buildRecordsRouter({
   router.post(
     '/teacher/exit/:rollNo/absent',
     api(async (req, res) => {
-      const { day, rollNo } = await findTeacherRecord(req, { restrictionType: 'exit' })
+      const { record, day, rollNo } = await findTeacherRecord(req, { restrictionType: 'exit' })
+      if (record.resolutionStatus === 'resolved') {
+        throw httpError(400, 'This exit restriction is already resolved for today.')
+      }
       const reason = String(req.body?.reason || '').trim()
       if (!reason) throw httpError(400, 'Give a reason for marking the student absent.')
 
@@ -1685,7 +1698,10 @@ export function buildRecordsRouter({
   router.post(
     '/teacher/exit/:rollNo/excuse',
     api(async (req, res) => {
-      const { day, rollNo } = await findTeacherRecord(req, { restrictionType: 'exit' })
+      const { record, day, rollNo } = await findTeacherRecord(req, { restrictionType: 'exit' })
+      if (record.resolutionStatus === 'resolved') {
+        throw httpError(400, 'This exit restriction is already resolved for today.')
+      }
       const approver = String(req.body?.approver || '').trim()
       if (!approver) throw httpError(400, 'Who approved the excuse?')
 
@@ -1826,6 +1842,7 @@ export function buildRecordsRouter({
     api(async (req, res) => {
       const { grade, section } = needSection(req.body || {})
       const date = req.body?.date || todayIso()
+      const teacher = await teacherOf(grade, section)
 
       // Closing the day is the teacher's 4/4 checkpoint, so every block must
       // actually be finished — not just the entry checks.
@@ -1845,7 +1862,7 @@ export function buildRecordsRouter({
           resolutionStatus: { $in: ['pending', 'acknowledged'] },
         }),
         EntrySection.findOne({ date, grade, section }).lean(),
-        LeaderMessage.findOne({ date, grade, section }).lean(),
+        LeaderMessage.findOne({ date, grade, section, sender: teacher }).lean(),
       ])
 
       if (pendingEntry > 0) {
