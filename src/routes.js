@@ -52,6 +52,24 @@ const MESSAGE_TYPES = {
   broadcast: 'Broadcast',
 }
 
+const INBOX_ROLE_LABEL = {
+  admin: 'Admin / Coordinator',
+  teacher: 'Class Teacher',
+  leader: 'Class Leader',
+  transport: 'Transport In-charge',
+  gate: 'Gate / Security',
+}
+
+const INBOX_TARGETS = {
+  teacher: ['LEADER', 'ADMIN', 'ALL'],
+  leader: ['TEACHER', 'ADMIN', 'ALL'],
+  transport: ['ADMIN', 'ALL'],
+  gate: ['ADMIN', 'ALL'],
+  admin: ['TEACHER', 'LEADER', 'TRANSPORT', 'GATE', 'ALL'],
+}
+
+const classLabelOf = (grade, section) => `${grade === 'PU1' ? '11' : '12'}${section}`
+
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 const isoDaysAgo = (days) =>
@@ -63,10 +81,45 @@ const toMinutes = (clock) => {
   return hours * 60 + minutes
 }
 
-const clockNow = () => {
-  const now = new Date()
-  return now.getHours() * 60 + now.getMinutes()
+// The school clock is Indian Standard Time no matter where the API runs, so
+// every timestamp the dashboards show matches the wall clock in the office.
+const IST = 'Asia/Kolkata'
+
+const istParts = (value = new Date()) => {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: IST,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(value)
+  const part = (type) => parts.find((entry) => entry.type === type)?.value || '00'
+  return { hour: part('hour'), minute: part('minute'), second: part('second') }
 }
+
+const istClock = (value) => {
+  const { hour, minute } = istParts(value)
+  return `${hour}:${minute}`
+}
+
+const istClockSeconds = (value) => {
+  const { hour, minute, second } = istParts(value)
+  return `${hour}:${minute}:${second}`
+}
+
+const clockNow = () => {
+  const { hour, minute } = istParts()
+  return Number(hour) * 60 + Number(minute)
+}
+
+// R1, R2, … R27 instead of the lexicographic R1, R10, R11, R2.
+const routeNumber = (route) => {
+  const match = String(route || '').match(/(\d+)/)
+  return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER
+}
+
+const byRoute = (a, b) =>
+  routeNumber(a) - routeNumber(b) || String(a).localeCompare(String(b))
 
 // Express 4 does not await handlers, so unwrap rejections into JSON errors.
 const api = (handler) => (req, res, next) => handler(req, res).catch(next)
@@ -102,6 +155,7 @@ export function buildRecordsRouter({
   LeaderMessage,
   LeaderNote,
   TeacherNotice,
+  InboxMessage,
   Section,
   Settings,
   AuditLog,
@@ -214,6 +268,7 @@ export function buildRecordsRouter({
           section: message.section,
           title: message.title,
           sentAt: message.sentAt,
+          sentAtIst: istClock(message.createdAt),
           acknowledgedAt: message.acknowledgedAt,
           overdue,
         }
@@ -780,8 +835,7 @@ export function buildRecordsRouter({
       }
 
       const day = date || todayIso()
-      const now = new Date()
-      const sentAt = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+      const sentAt = istClock()
 
       const shared = {
         date: day,
@@ -810,9 +864,27 @@ export function buildRecordsRouter({
         readAt: null,
       }))
 
+      // Transport and gate only receive, so the same broadcast lands in their
+      // inboxes as one row each.
+      const deskDocs = ['TRANSPORT', 'GATE'].map((toRole) => ({
+        date: day,
+        title: subject,
+        body: text,
+        fromRole: 'admin',
+        fromName: shared.sender,
+        fromEmail: shared.sentBy,
+        fromContext: 'Admin / Coordinator',
+        toRole,
+        grade: null,
+        section: null,
+        sentAt,
+        readAt: null,
+      }))
+
       await Promise.all([
         LeaderMessage.insertMany(leaderDocs, { ordered: false }),
         TeacherNotice.insertMany(teacherDocs, { ordered: false }),
+        InboxMessage.insertMany(deskDocs, { ordered: false }),
       ])
 
       await writeAudit(
@@ -873,6 +945,7 @@ export function buildRecordsRouter({
             sentBy: doc.sentBy || null,
             date: doc.date,
             sentAt: doc.sentAt,
+            sentAtIst: istClock(doc.createdAt),
             createdAt: doc.createdAt,
             sections: [],
             seen: 0,
@@ -922,6 +995,214 @@ export function buildRecordsRouter({
         limited: !lookingUp,
         messages,
       })
+    })
+  )
+
+  // ---- shared inbox -------------------------------------------------------
+
+  const inboxRow = (doc) => ({
+    id: String(doc._id),
+    title: doc.title,
+    body: doc.body || '',
+    fromName: doc.fromName || 'Daily Check',
+    fromRole: doc.fromRole || 'admin',
+    fromContext: doc.fromContext || null,
+    sentAt: doc.sentAt,
+    sentAtIst: istClock(doc.createdAt),
+    readAt: doc.readAt || null,
+    at: doc.createdAt ? new Date(doc.createdAt).toISOString() : null,
+  })
+
+  const inboxRoleFor = (role) =>
+    role === 'teacher'
+      ? 'TEACHER'
+      : role === 'transport'
+        ? 'TRANSPORT'
+        : role === 'gate'
+          ? 'GATE'
+          : 'ADMIN'
+
+  const senderContext = (user) =>
+    user.role === 'teacher' || user.role === 'leader'
+      ? `${classLabelOf(user.grade, user.section)} · ${INBOX_ROLE_LABEL[user.role]}`
+      : INBOX_ROLE_LABEL[user.role] || 'Daily Check'
+
+  // Every dashboard reads its own slice here: the role comes from the signed
+  // session, never from the query string.
+  router.get(
+    '/messages/inbox',
+    api(async (req, res) => {
+      const user = req.user || {}
+      const role = user.role || 'admin'
+      const date = String(req.query.date || todayIso())
+      const wanted = inboxRoleFor(role)
+
+      const direct = await InboxMessage.find({
+        date,
+        toRole: { $in: [wanted, 'ALL'] },
+      })
+        .sort({ createdAt: -1 })
+        .lean()
+
+      // A teacher only sees section-scoped rows for their own section; shared
+      // broadcast rows carry no section and reach everyone.
+      const visible = direct.filter(
+        (doc) =>
+          role !== 'teacher' ||
+          !doc.grade ||
+          (doc.grade === user.grade && doc.section === user.section)
+      )
+
+      const readAt = istClock()
+      const readBy = user.name || INBOX_ROLE_LABEL[role] || 'Daily Check'
+      let unread = visible.filter((doc) => !doc.readAt).length
+
+      const unreadIds = visible.filter((doc) => !doc.readAt).map((doc) => doc._id)
+      if (unreadIds.length > 0) {
+        await InboxMessage.updateMany(
+          { _id: { $in: unreadIds } },
+          { $set: { readAt, readBy } }
+        )
+      }
+
+      let items = visible.map(inboxRow)
+
+      // The teacher inbox also carries the admin broadcasts and the leader's
+      // notes, so one screen shows everything addressed to the class teacher.
+      if (role === 'teacher') {
+        const [notices, notes, teacher] = await Promise.all([
+          TeacherNotice.find({ date, grade: user.grade, section: user.section }).lean(),
+          LeaderNote.find({ date, grade: user.grade, section: user.section }).lean(),
+          teacherOf(user.grade, user.section),
+        ])
+
+        const unreadNotices = notices.filter((notice) => !notice.readAt)
+        const unreadNotes = notes.filter((note) => !note.readAt)
+        unread += unreadNotices.length + unreadNotes.length
+
+        items = [
+          ...items,
+          ...notices.map((notice) => ({
+            id: String(notice._id),
+            title: notice.title,
+            body: notice.body,
+            fromName: notice.sender || 'Admin / Coordinator',
+            fromRole: 'admin',
+            fromContext: 'Admin / Coordinator',
+            sentAt: notice.sentAt,
+            sentAtIst: istClock(notice.createdAt),
+            readAt: notice.readAt || null,
+            at: notice.createdAt ? new Date(notice.createdAt).toISOString() : null,
+          })),
+          ...notes.map((note) => ({
+            id: String(note._id),
+            title: 'Note from the class leader',
+            body: note.body,
+            fromName: note.author,
+            fromRole: 'leader',
+            fromContext: classLabelOf(user.grade, user.section),
+            sentAt: note.sentAt,
+            sentAtIst: istClock(note.createdAt),
+            readAt: note.readAt || null,
+            at: note.createdAt ? new Date(note.createdAt).toISOString() : null,
+          })),
+        ]
+
+        const updates = []
+        if (unreadNotices.length > 0) {
+          updates.push(
+            TeacherNotice.updateMany(
+              { _id: { $in: unreadNotices.map((notice) => notice._id) } },
+              { $set: { readAt, readBy: teacher } }
+            )
+          )
+        }
+        if (unreadNotes.length > 0) {
+          updates.push(
+            LeaderNote.updateMany(
+              { _id: { $in: unreadNotes.map((note) => note._id) } },
+              { $set: { readAt, readBy: teacher } }
+            )
+          )
+        }
+        if (updates.length > 0) await Promise.all(updates)
+      }
+
+      items.sort((a, b) =>
+        String(b.at || b.sentAt).localeCompare(String(a.at || a.sentAt))
+      )
+
+      res.json({ date, role, unread, messages: items })
+    })
+  )
+
+  router.post(
+    '/messages/inbox',
+    api(async (req, res) => {
+      const user = req.user || {}
+      const role = user.role || 'admin'
+      const allowed = INBOX_TARGETS[role] || ['ADMIN']
+      const to = String(req.body?.to || '').trim().toUpperCase()
+      if (!allowed.includes(to)) throw httpError(400, 'Choose who should receive this message.')
+
+      const body = String(req.body?.body || '').trim()
+      if (body.length < 3) throw httpError(400, 'Write the message you want to send.')
+      if (body.length > 1000) throw httpError(400, 'Keep the message under 1000 characters.')
+
+      const fromName = user.name || INBOX_ROLE_LABEL[role] || 'Daily Check'
+      const title = (
+        String(req.body?.title || '').trim() || `Message from ${fromName}`
+      ).slice(0, 120)
+      const day = req.body?.date || todayIso()
+      const sentAt = istClock()
+      const context = senderContext(user)
+      const targets = to === 'ALL' ? ['ADMIN', 'TRANSPORT', 'GATE'] : [to]
+
+      let delivered = 0
+
+      // A class teacher messaging the leader writes the same row the leader
+      // inbox reads, so the daily-check message block is satisfied too.
+      if (targets.includes('LEADER')) {
+        await LeaderMessage.create({
+          date: day,
+          grade: user.grade,
+          section: user.section,
+          title,
+          type: 'update',
+          target: 'Class Leader',
+          sender: fromName,
+          sentBy: user.email || null,
+          body,
+          sentAt,
+          acknowledgedAt: null,
+        })
+        delivered += 1
+      }
+
+      const docs = targets
+        .filter((target) => target !== 'LEADER')
+        .map((toRole) => ({
+          date: day,
+          title,
+          body,
+          fromRole: role,
+          fromName,
+          fromEmail: user.email || null,
+          fromContext: context,
+          toRole,
+          grade: ['TEACHER', 'LEADER'].includes(toRole) ? user.grade : null,
+          section: ['TEACHER', 'LEADER'].includes(toRole) ? user.section : null,
+          sentAt,
+          readAt: null,
+        }))
+
+      if (docs.length > 0) {
+        await InboxMessage.insertMany(docs)
+        delivered += docs.length
+      }
+
+      await writeAudit(AuditLog, 'Message sent', `${title} → ${to} (${delivered} inbox)`)
+      res.status(201).json({ ok: true, sent: delivered, target: to, sentAt })
     })
   )
 
@@ -1051,12 +1332,7 @@ export function buildRecordsRouter({
 
   // ---- class leader inbox ------------------------------------------------
 
-  const clockSeconds = () => {
-    const now = new Date()
-    return [now.getHours(), now.getMinutes(), now.getSeconds()]
-      .map((part) => String(part).padStart(2, '0'))
-      .join(':')
-  }
+  const clockSeconds = () => istClockSeconds()
 
   const leaderOf = async (grade, section) =>
     Student.findOne({ grade, section }).sort({ rollNo: 1 }).lean()
@@ -1093,6 +1369,7 @@ export function buildRecordsRouter({
           students: (message.students || []).map((student) => student.name),
           exitTime: message.exitTime || null,
           sentAt: message.sentAt,
+          sentAtIst: istClock(message.createdAt),
           status: message.acknowledgedAt ? 'acknowledged' : 'unread',
           seenAt: message.seenAt || null,
           acknowledgedAt: message.acknowledgedAt,
@@ -1188,6 +1465,7 @@ export function buildRecordsRouter({
     body: note.body,
     author: note.author,
     sentAt: note.sentAt,
+    sentAtIst: istClock(note.createdAt),
     readAt: note.readAt || null,
     readBy: note.readBy || null,
   })
@@ -1466,10 +1744,7 @@ export function buildRecordsRouter({
     return { grade, section }
   }
 
-  const nowClock = () => {
-    const now = new Date()
-    return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
-  }
+  const nowClock = () => istClock()
 
   const messageStatus = (message, clock) => {
     if (!message) return null
@@ -1582,6 +1857,7 @@ export function buildRecordsRouter({
               title: latestMessage.title,
               type: latestMessage.type,
               sentAt: latestMessage.sentAt,
+              sentAtIst: istClock(latestMessage.createdAt),
               seenAt: latestMessage.seenAt,
               acknowledgedAt: latestMessage.acknowledgedAt,
               status: messageStatus(latestMessage, clock),
@@ -1635,6 +1911,7 @@ export function buildRecordsRouter({
     target: notice.target,
     sender: notice.sender || 'Admin / Coordinator',
     sentAt: notice.sentAt,
+    sentAtIst: istClock(notice.createdAt),
     readAt: notice.readAt || null,
     readBy: notice.readBy || null,
   })
@@ -2022,6 +2299,7 @@ export function buildRecordsRouter({
         riders: students.filter((student) => student.rider).length,
       }
     })
+      .sort((a, b) => byRoute(a.route, b.route))
 
     return {
       date,
@@ -2633,7 +2911,9 @@ export function buildRecordsRouter({
           .select('rollNo name grade section excusedApprover restrictionReason resolutionNote gateExitTime')
           .lean(),
         GateLog ? GateLog.find({ date }).sort({ createdAt: -1 }).limit(100).lean() : [],
-        BusLog.find({ date }).sort({ route: 1 }).lean(),
+        BusLog.find({ date })
+          .lean()
+          .then((rows) => rows.sort((a, b) => byRoute(a.route, b.route))),
       ])
 
       const passesMap = new Map()

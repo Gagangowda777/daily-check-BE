@@ -15,6 +15,7 @@ import Settings from './src/models/Settings.js'
 import AuditLog from './src/models/AuditLog.js'
 import GateLog from './src/models/GateLog.js'
 import DailyNote from './src/models/DailyNote.js'
+import InboxMessage from './src/models/InboxMessage.js'
 import { buildRecordsRouter } from './src/routes.js'
 import {
   buildAuthRouter,
@@ -103,6 +104,7 @@ app.use(
     AuditLog,
     GateLog,
     DailyNote,
+    InboxMessage,
   })
 )
 
