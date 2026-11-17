@@ -151,7 +151,7 @@ export function buildRecordsRouter({
       const exitMatch = { ...match, restrictionType: 'exit' }
       const entryMatch = { ...match, restrictionType: 'entry' }
 
-      const [busRoutes, entrySections, messages, exitRows, entryRows, handover, exitGroups, entryGroups] =
+      const [busRoutes, entrySections, messages, exitRows, entryRows, handover, exitGroups, entryGroups, busLateGroups] =
         await Promise.all([
           BusLog.find({ date }).sort({ route: 1 }).lean(),
           EntrySection.find({ date, ...sectionFilter }).sort({ grade: 1, section: 1 }).lean(),
@@ -169,13 +169,27 @@ export function buildRecordsRouter({
           DailyRecord.countDocuments({ ...entryMatch, handover: true }),
           DailyRecord.aggregate([{ $match: exitMatch }, { $group: { _id: '$resolutionStatus', count: { $sum: 1 } } }]),
           DailyRecord.aggregate([{ $match: entryMatch }, { $group: { _id: '$resolutionStatus', count: { $sum: 1 } } }]),
+          DailyRecord.aggregate([
+            { $match: { date, busLate: true } },
+            { $group: { _id: '$busRoute', count: { $sum: 1 } } },
+          ]),
         ])
 
       // Route codes are strings, so sort numerically (R1, R2, … R10).
       busRoutes.sort((a, b) => Number(a.route.slice(1)) - Number(b.route.slice(1)))
 
-      const lateRoutes = busRoutes.filter((route) => route.late)
-      const notArrived = busRoutes.filter((route) => !route.arrivalTime)
+      // A manual transport override wins over the computed lateness, and the
+      // affected count comes from the students actually marked late — the
+      // stored BusLog.late/affectedStudents are only the last computed values.
+      const busLateMap = new Map(busLateGroups.map((group) => [group._id, group.count]))
+      const effectiveLate = (route) =>
+        route.overrideLate === true || route.overrideLate === false
+          ? route.overrideLate
+          : Boolean(route.late)
+      const hasOverride = (route) => route.overrideLate === true || route.overrideLate === false
+
+      const lateRoutes = busRoutes.filter(effectiveLate)
+      const notArrived = busRoutes.filter((route) => !route.arrivalTime && !hasOverride(route))
       const busCutoffPassed = clock >= toMinutes(SECOND_CUTOFF)
 
       const exitByStatus = countByStatus(exitGroups)
@@ -210,10 +224,13 @@ export function buildRecordsRouter({
         buses: {
           totalRoutes: busRoutes.length,
           lateRoutes: lateRoutes.length,
-          affectedStudents: lateRoutes.reduce((sum, route) => sum + route.affectedStudents, 0),
+          affectedStudents: lateRoutes.reduce(
+            (sum, route) => sum + (busLateMap.get(route.route) || 0),
+            0
+          ),
           notArrived: notArrived.map((route) => ({
             route: route.route,
-            affectedStudents: route.affectedStudents,
+            affectedStudents: busLateMap.get(route.route) || 0,
           })),
           secondCutoff: SECOND_CUTOFF,
           cutoffPassed: busCutoffPassed,
@@ -221,8 +238,8 @@ export function buildRecordsRouter({
           routes: busRoutes.map((route) => ({
             route: route.route,
             arrivalTime: route.arrivalTime,
-            late: route.late,
-            affectedStudents: route.affectedStudents,
+            late: effectiveLate(route),
+            affectedStudents: busLateMap.get(route.route) || 0,
           })),
         },
         exit: {
@@ -409,8 +426,12 @@ export function buildRecordsRouter({
         }
 
         const reason = row.reason && String(row.reason).trim() ? String(row.reason).trim() : defaultReason
-        const untilResolved = Boolean(row.untilResolved || !row.endDate)
-        const endDate = untilResolved ? null : row.endDate
+        // An explicit "today only" row must stay that way; give it today's date
+        // so the register never holds a restriction with no expiry.
+        const untilResolved = row.untilResolved === false
+          ? false
+          : Boolean(row.untilResolved || !row.endDate)
+        const endDate = untilResolved ? null : row.endDate || day
 
         ops.push({
           updateOne: {
@@ -1047,11 +1068,14 @@ export function buildRecordsRouter({
       const date = req.query.date || todayIso()
 
       // Opening the inbox is what "seen" means; keep unacknowledged messages
-      // stamped so the class teacher can see the leader has read them.
-      await LeaderMessage.updateMany(
-        { date, grade, section, acknowledgedAt: null, seenAt: null },
-        { $set: { seenAt: nowClock() } }
-      )
+      // stamped so the class teacher can see the leader has read them. Only do
+      // this for today — browsing history must not rewrite an old day.
+      if (date === todayIso()) {
+        await LeaderMessage.updateMany(
+          { date, grade, section, acknowledgedAt: null, seenAt: null },
+          { $set: { seenAt: nowClock() } }
+        )
+      }
 
       const [messages, leader] = await Promise.all([
         LeaderMessage.find({ date, grade, section }).lean(),
@@ -1109,6 +1133,9 @@ export function buildRecordsRouter({
       if (!message) throw httpError(404, 'That message is not in this section’s inbox.')
       if (message.acknowledgedAt) {
         throw httpError(400, 'This message is already acknowledged and locked.')
+      }
+      if (message.date !== todayIso()) {
+        throw httpError(400, 'Messages can only be acknowledged on the day they were sent.')
       }
 
       const leader = await leaderOf(grade, section)
@@ -1230,6 +1257,9 @@ export function buildRecordsRouter({
 
       const exitOpen = exit.filter((row) => ['pending', 'acknowledged'].includes(row.status))
       const unread = messages.filter((message) => !message.acknowledgedAt).length
+      // Only the class teacher's own message satisfies the daily-check block;
+      // admin broadcasts also live in LeaderMessage and must not count.
+      const fromTeacher = messages.filter((message) => message.sender === teacher)
 
       res.json({
         date,
@@ -1250,6 +1280,7 @@ export function buildRecordsRouter({
           entryPending: entry.length,
           messages: messages.length,
           unread,
+          teacherMessages: fromTeacher.length,
         },
         nc: {
           count: entryDoc?.ncCount ?? null,
@@ -2205,6 +2236,16 @@ export function buildRecordsRouter({
 
       const day = date || todayIso()
       const rollNo = String(req.params.rollNo).toUpperCase()
+      const current = await DailyRecord.findOne({
+        date: day,
+        rollNo,
+        restrictionType: 'exit',
+      }).lean()
+      if (!current) throw httpError(404, 'No exit restriction found for that student.')
+      if (current.resolutionStatus === 'resolved') {
+        throw httpError(400, 'This exit restriction is already resolved.')
+      }
+
       const record = await DailyRecord.findOneAndUpdate(
         { date: day, rollNo, restrictionType: 'exit' },
         {
@@ -2232,6 +2273,16 @@ export function buildRecordsRouter({
 
       const day = date || todayIso()
       const rollNo = String(req.params.rollNo).toUpperCase()
+      const current = await DailyRecord.findOne({
+        date: day,
+        rollNo,
+        restrictionType: 'exit',
+      }).lean()
+      if (!current) throw httpError(404, 'No exit restriction found for that student.')
+      if (current.resolutionStatus === 'resolved') {
+        throw httpError(400, 'This exit restriction is already resolved.')
+      }
+
       const record = await DailyRecord.findOneAndUpdate(
         { date: day, rollNo, restrictionType: 'exit' },
         {
@@ -2261,26 +2312,19 @@ export function buildRecordsRouter({
     api(async (req, res) => {
       await ensureToday()
       const date = req.query.date || todayIso()
-      const [routes, lateGroups] = await Promise.all([
-        BusLog.find({ date }).lean(),
-        DailyRecord.aggregate([
-          { $match: { date, busLate: true } },
-          { $group: { _id: '$busRoute', count: { $sum: 1 }, rolls: { $push: '$rollNo' } } },
-        ]),
-      ])
+      // Reuse the transport view so manual overrides and rider flags agree with
+      // what the transport in-charge sees.
+      const day = await transportDay(date)
+      const rows = day.routes.map((route) => ({
+        route: route.route,
+        arrivalTime: route.arrivalTime,
+        status: route.status,
+        studentsOnRoute: route.riders,
+        lateStudents: route.students.filter((student) => student.rider && student.busLate).length,
+        override: route.override,
+      }))
 
-      const lateMap = new Map(lateGroups.map((group) => [group._id, group]))
-      const rows = routes
-        .map((route) => ({
-          route: route.route,
-          arrivalTime: route.arrivalTime,
-          status: !route.arrivalTime ? 'not-arrived' : route.late ? 'late' : 'on-time',
-          studentsOnRoute: route.affectedStudents,
-          lateStudents: lateMap.get(route.route)?.count || 0,
-        }))
-        .sort((a, b) => Number(a.route.slice(1)) - Number(b.route.slice(1)))
-
-      res.json({ date, rows })
+      res.json({ date, summary: day.summary, rows })
     })
   )
 
@@ -3139,7 +3183,10 @@ export function buildRecordsRouter({
                 restrictionReason: detail || 'Crossed 3 NCs',
                 resolutionStatus: 'pending',
                 restrictionUntilResolved: row.untilResolved !== false,
-                restrictionEndDate: row.endDate || null,
+                // "Today only" rows still need a concrete end date, otherwise
+                // the register would show a restriction with no expiry at all.
+                restrictionEndDate:
+                  row.untilResolved === false ? row.endDate || day : row.endDate || null,
               },
               $setOnInsert: {
                 date: day,
