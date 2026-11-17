@@ -36,7 +36,28 @@ const origins = (
   .map((origin) => origin.trim())
   .filter(Boolean)
 
-app.use(cors({ origin: origins }))
+// Entries are literal origins, but `*` is allowed inside one so Vercel preview
+// URLs (every deployment gets a new subdomain) can be covered in one rule:
+//   https://*.vercel.app
+const escapePart = (part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const originPatterns = origins.map(
+  (rule) => new RegExp(`^${rule.split('*').map(escapePart).join('[^.]+')}$`)
+)
+
+const originAllowed = (origin) => originPatterns.some((pattern) => pattern.test(origin))
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // No Origin header: curl, health checks, same-origin server calls.
+      if (!origin) {
+        callback(null, true)
+        return
+      }
+      callback(null, originAllowed(origin))
+    },
+  })
+)
 app.use(express.json({ limit: '1mb' }))
 
 // Hosts like Render inject a real PORT. The desktop runner injects PORT=0,
