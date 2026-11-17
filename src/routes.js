@@ -810,19 +810,26 @@ export function buildRecordsRouter({
     })
   )
 
-  // Outbox for the signed-in admin: every broadcast this account sent, with
-  // how many sections received it and how many leaders/teachers responded.
+  // Outbox for the signed-in admin: last five broadcasts by default, or a
+  // title / day lookup when the admin is looking for a particular message.
   router.get(
     '/messages/sent',
     api(async (req, res) => {
       const account = String(req.user?.email || '').trim()
+      const titleQuery = String(req.query.q || '').trim()
+      const day = String(req.query.date || '').trim()
+      const sortOldest = String(req.query.sort || '').toLowerCase() === 'oldest'
+      const lookingUp = Boolean(titleQuery || day || sortOldest)
+
       const filter = account
         ? { $or: [{ sentBy: account }, { sentBy: null }, { sentBy: { $exists: false } }] }
         : {}
+      if (day) filter.date = day
+      if (titleQuery) filter.title = { $regex: escapeRegex(titleQuery), $options: 'i' }
 
       const docs = await LeaderMessage.find(filter)
-        .sort({ createdAt: -1 })
-        .limit(400)
+        .sort({ createdAt: sortOldest ? 1 : -1 })
+        .limit(lookingUp ? 2000 : 400)
         .lean()
 
       const groups = new Map()
@@ -874,14 +881,26 @@ export function buildRecordsRouter({
         }
       }
 
-      const all = [...groups.values()].map((group) => ({
-        ...group,
-        sectionCount: group.sections.length,
-        sectionsLabel: [...group.sections].sort().join(', '),
-      }))
-      const messages = all.slice(0, 60)
+      const stamp = (group) => `${group.date || ''}T${group.sentAt || '00:00'}`
+      const newestFirst = [...groups.values()]
+        .map((group) => ({
+          ...group,
+          sectionCount: group.sections.length,
+          sectionsLabel: [...group.sections].sort().join(', '),
+        }))
+        .sort((a, b) => stamp(b).localeCompare(stamp(a)))
 
-      res.json({ account: account || null, total: all.length, messages })
+      const DEFAULT_VISIBLE = 5
+      const pool = lookingUp ? newestFirst.slice(0, 200) : newestFirst.slice(0, DEFAULT_VISIBLE)
+      const messages = sortOldest ? [...pool].reverse() : pool
+
+      res.json({
+        account: account || null,
+        total: newestFirst.length,
+        shown: messages.length,
+        limited: !lookingUp,
+        messages,
+      })
     })
   )
 
