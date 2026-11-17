@@ -39,9 +39,11 @@ const origins = (
 app.use(cors({ origin: origins }))
 app.use(express.json({ limit: '1mb' }))
 
-// Hosts like Render inject PORT; the local .env uses API_PORT, and the desktop
-// runner injects its own PORT, so both are honoured.
-const PORT = Number(process.env.PORT || process.env.API_PORT || 4000)
+// Hosts like Render inject a real PORT. The desktop runner injects PORT=0,
+// which must not win, and the local .env uses API_PORT.
+const injected = Number(process.env.PORT)
+const PORT =
+  Number.isFinite(injected) && injected > 0 ? injected : Number(process.env.API_PORT) || 4000
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, db: isConnected() ? 'connected' : 'disconnected' })
