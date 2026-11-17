@@ -9,6 +9,7 @@ import BusLog from './src/models/BusLog.js'
 import EntrySection from './src/models/EntrySection.js'
 import LeaderMessage from './src/models/LeaderMessage.js'
 import LeaderNote from './src/models/LeaderNote.js'
+import TeacherNotice from './src/models/TeacherNotice.js'
 import Section from './src/models/Section.js'
 import Settings from './src/models/Settings.js'
 import AuditLog from './src/models/AuditLog.js'
@@ -96,6 +97,7 @@ app.use(
     EntrySection,
     LeaderMessage,
     LeaderNote,
+    TeacherNotice,
     Section,
     Settings,
     AuditLog,

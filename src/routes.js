@@ -51,13 +51,6 @@ const MESSAGE_TYPES = {
   broadcast: 'Broadcast',
 }
 
-const MESSAGE_BODIES = {
-  update: ['Update from the class teacher. Details are on the notice board.'],
-  announcement: ['Announcement from the administration. Please read it out in class.'],
-  'authorized-exit': ['Authorized exit approved by the coordinator. Gate pass is ready at the desk.'],
-  broadcast: ['Broadcast to all sections. Check the notice board for details.'],
-}
-
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 const isoDaysAgo = (days) =>
@@ -107,6 +100,7 @@ export function buildRecordsRouter({
   EntrySection,
   LeaderMessage,
   LeaderNote,
+  TeacherNotice,
   Section,
   Settings,
   AuditLog,
@@ -728,9 +722,15 @@ export function buildRecordsRouter({
   router.post(
     '/messages',
     api(async (req, res) => {
-      const { type, scope, sections = [], date } = req.body || {}
+      const { type, scope, sections = [], date, title, body } = req.body || {}
 
       if (!MESSAGE_TYPES[type]) throw httpError(400, 'Choose a message type.')
+
+      const subject = String(title || '').trim() || MESSAGE_TYPES[type]
+      const text = String(body || '').trim()
+      if (subject.length > 120) throw httpError(400, 'Keep the subject under 120 characters.')
+      if (text.length < 3) throw httpError(400, 'Write the message you want to send.')
+      if (text.length > 1000) throw httpError(400, 'Keep the message under 1000 characters.')
 
       let targets = []
       let targetLabel = 'Whole School'
@@ -761,27 +761,49 @@ export function buildRecordsRouter({
       const now = new Date()
       const sentAt = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
 
-      const docs = targets.map((row) => ({
+      const shared = {
         date: day,
-        grade: row.grade,
-        section: row.section,
-        title: MESSAGE_TYPES[type],
+        title: subject,
         type,
         target: targetLabel,
         sender: 'Admin / Coordinator',
-        body: MESSAGE_BODIES[type]?.[0] || MESSAGE_TYPES[type],
+        body: text,
         sentAt,
+      }
+
+      // The same broadcast lands in the class leader inbox and on the class
+      // teacher dashboard, so nobody has to forward it by hand.
+      const leaderDocs = targets.map((row) => ({
+        ...shared,
+        grade: row.grade,
+        section: row.section,
         acknowledgedAt: null,
       }))
+      const teacherDocs = targets.map((row) => ({
+        ...shared,
+        grade: row.grade,
+        section: row.section,
+        readAt: null,
+      }))
 
-      await LeaderMessage.insertMany(docs, { ordered: false })
+      await Promise.all([
+        LeaderMessage.insertMany(leaderDocs, { ordered: false }),
+        TeacherNotice.insertMany(teacherDocs, { ordered: false }),
+      ])
 
       await writeAudit(
         AuditLog,
         'Message sent',
-        `${MESSAGE_TYPES[type]} → ${targetLabel} (${docs.length} section(s))`
+        `${subject} (${MESSAGE_TYPES[type]}) → ${targetLabel} (${leaderDocs.length} section(s), leaders + teachers)`
       )
-      res.status(201).json({ date: day, sent: docs.length, target: targetLabel, type })
+      res.status(201).json({
+        date: day,
+        sent: leaderDocs.length,
+        teachers: teacherDocs.length,
+        target: targetLabel,
+        type,
+        title: subject,
+      })
     })
   )
 
@@ -1467,6 +1489,53 @@ export function buildRecordsRouter({
         await note.save()
       }
       res.json({ ok: true, readAt: note.readAt, readBy: note.readBy })
+    })
+  )
+
+  // Admin / coordinator broadcasts addressed to this section's class teacher.
+  const noticeRow = (notice) => ({
+    id: String(notice._id),
+    title: notice.title,
+    body: notice.body,
+    type: notice.type,
+    typeLabel: MESSAGE_TYPES[notice.type] || notice.type,
+    target: notice.target,
+    sender: notice.sender || 'Admin / Coordinator',
+    sentAt: notice.sentAt,
+    readAt: notice.readAt || null,
+    readBy: notice.readBy || null,
+  })
+
+  router.get(
+    '/teacher/notices',
+    api(async (req, res) => {
+      const { grade, section } = needSection(req.query)
+      const date = req.query.date || todayIso()
+      const notices = await TeacherNotice.find({ date, grade, section })
+        .sort({ createdAt: -1 })
+        .lean()
+      res.json({
+        date,
+        unread: notices.filter((notice) => !notice.readAt).length,
+        notices: notices.map(noticeRow),
+      })
+    })
+  )
+
+  router.post(
+    '/teacher/notices/:id/read',
+    api(async (req, res) => {
+      const { grade, section } = needSection(req.body || {})
+      if (!/^[0-9a-f]{24}$/i.test(req.params.id)) throw httpError(400, 'Unknown message.')
+
+      const notice = await TeacherNotice.findOne({ _id: req.params.id, grade, section })
+      if (!notice) throw httpError(404, 'That message is not addressed to this section.')
+      if (!notice.readAt) {
+        notice.readAt = nowClock()
+        notice.readBy = await teacherOf(grade, section)
+        await notice.save()
+      }
+      res.json({ ok: true, readAt: notice.readAt, readBy: notice.readBy })
     })
   )
 
