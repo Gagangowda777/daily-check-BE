@@ -15,6 +15,8 @@ const leaderMessageSchema = new mongoose.Schema(
     },
     target: { type: String, default: 'Whole School' },
     sender: { type: String, default: null }, // who sent it
+    sentBy: { type: String, default: null }, // signed-in admin account email
+    batchId: { type: String, default: null, index: true }, // one broadcast across sections
     body: { type: String, default: null }, // message text
     // Authorized exits name the students released and when.
     students: { type: [{ rollNo: String, name: String }], default: [] },

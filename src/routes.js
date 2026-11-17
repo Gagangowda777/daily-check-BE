@@ -1,4 +1,5 @@
 import express from 'express'
+import { randomUUID } from 'node:crypto'
 import { ensureDay } from './day.js'
 import {
   DEFAULT_BUS_CUTOFF,
@@ -767,6 +768,8 @@ export function buildRecordsRouter({
         type,
         target: targetLabel,
         sender: 'Admin / Coordinator',
+        sentBy: req.user?.email || null,
+        batchId: randomUUID(),
         body: text,
         sentAt,
       }
@@ -804,6 +807,81 @@ export function buildRecordsRouter({
         type,
         title: subject,
       })
+    })
+  )
+
+  // Outbox for the signed-in admin: every broadcast this account sent, with
+  // how many sections received it and how many leaders/teachers responded.
+  router.get(
+    '/messages/sent',
+    api(async (req, res) => {
+      const account = String(req.user?.email || '').trim()
+      const filter = account
+        ? { $or: [{ sentBy: account }, { sentBy: null }, { sentBy: { $exists: false } }] }
+        : {}
+
+      const docs = await LeaderMessage.find(filter)
+        .sort({ createdAt: -1 })
+        .limit(400)
+        .lean()
+
+      const groups = new Map()
+      for (const doc of docs) {
+        // Broadcasts created before batch ids fall back to a stable composite
+        // key so their per-section rows still appear as one message.
+        const key =
+          doc.batchId || `${doc.date}|${doc.sentAt}|${doc.title}|${doc.target}|${doc.sender}`
+        let group = groups.get(key)
+        if (!group) {
+          group = {
+            id: key,
+            batchId: doc.batchId || null,
+            title: doc.title,
+            body: doc.body || '',
+            type: doc.type,
+            typeLabel: MESSAGE_TYPES[doc.type] || doc.type,
+            target: doc.target,
+            sender: doc.sender || 'Admin / Coordinator',
+            sentBy: doc.sentBy || null,
+            date: doc.date,
+            sentAt: doc.sentAt,
+            createdAt: doc.createdAt,
+            sections: [],
+            seen: 0,
+            acknowledged: 0,
+            teacherRead: 0,
+            teacherTotal: 0,
+          }
+          groups.set(key, group)
+        }
+
+        group.sections.push(`${doc.grade === 'PU1' ? '11' : '12'}${doc.section}`)
+        if (doc.seenAt) group.seen += 1
+        if (doc.acknowledgedAt) group.acknowledged += 1
+      }
+
+      const batchIds = [...groups.values()]
+        .map((group) => group.batchId)
+        .filter(Boolean)
+
+      if (batchIds.length > 0) {
+        const notices = await TeacherNotice.find({ batchId: { $in: batchIds } }).lean()
+        for (const notice of notices) {
+          const group = groups.get(notice.batchId)
+          if (!group) continue
+          group.teacherTotal += 1
+          if (notice.readAt) group.teacherRead += 1
+        }
+      }
+
+      const all = [...groups.values()].map((group) => ({
+        ...group,
+        sectionCount: group.sections.length,
+        sectionsLabel: [...group.sections].sort().join(', '),
+      }))
+      const messages = all.slice(0, 60)
+
+      res.json({ account: account || null, total: all.length, messages })
     })
   )
 

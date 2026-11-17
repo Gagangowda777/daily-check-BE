@@ -18,6 +18,8 @@ const teacherNoticeSchema = new mongoose.Schema(
     },
     target: { type: String, default: 'Whole School' },
     sender: { type: String, default: 'Admin / Coordinator' },
+    sentBy: { type: String, default: null }, // signed-in admin account email
+    batchId: { type: String, default: null, index: true }, // one broadcast across sections
     sentAt: { type: String, required: true }, // HH:MM
     readAt: { type: String, default: null }, // HH:MM, null = unread
     readBy: { type: String, default: null },
