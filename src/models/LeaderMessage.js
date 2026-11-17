@@ -1,0 +1,32 @@
+import mongoose from 'mongoose'
+
+// Class leaders broadcast updates; sections acknowledge within 30 minutes.
+const leaderMessageSchema = new mongoose.Schema(
+  {
+    date: { type: String, required: true, index: true },
+    grade: { type: String, required: true, enum: ['PU1', 'PU2'] },
+    section: { type: String, required: true },
+    title: { type: String, required: true },
+    type: {
+      type: String,
+      required: true,
+      enum: ['update', 'announcement', 'authorized-exit', 'broadcast'],
+      default: 'broadcast',
+    },
+    target: { type: String, default: 'Whole School' },
+    sender: { type: String, default: null }, // who sent it
+    body: { type: String, default: null }, // message text
+    // Authorized exits name the students released and when.
+    students: { type: [{ rollNo: String, name: String }], default: [] },
+    exitTime: { type: String, default: null }, // HH:MM
+    sentAt: { type: String, required: true }, // HH:MM
+    seenAt: { type: String, default: null }, // HH:MM
+    acknowledgedAt: { type: String, default: null }, // HH:MM[:SS]
+    acknowledgedBy: { type: String, default: null }, // class leader who tapped it
+  },
+  { timestamps: true }
+)
+
+leaderMessageSchema.index({ date: 1, grade: 1, section: 1 })
+
+export default mongoose.model('LeaderMessage', leaderMessageSchema)
