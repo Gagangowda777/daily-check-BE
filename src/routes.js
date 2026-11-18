@@ -259,17 +259,22 @@ export function buildRecordsRouter({
 
       const messageItems = messages.map((message) => {
         const sent = toMinutes(message.sentAt)
-        const acked = toMinutes(message.acknowledgedAt)
-        const slowAck = acked !== null && acked - sent > ACK_WINDOW_MINUTES
+        // A class leader marks a message read by opening the inbox; older rows
+        // still carry an explicit acknowledgement stamp.
+        const readAt = message.seenAt || message.acknowledgedAt || null
+        const readName = message.seenBy || message.acknowledgedBy || null
+        const readMinutes = toMinutes(readAt)
+        const slowRead = readMinutes !== null && readMinutes - sent > ACK_WINDOW_MINUTES
         const overdue =
-          clock - sent > ACK_WINDOW_MINUTES && (acked === null || slowAck)
+          clock - sent > ACK_WINDOW_MINUTES && (readMinutes === null || slowRead)
         return {
           grade: message.grade,
           section: message.section,
           title: message.title,
           sentAt: message.sentAt,
           sentAtIst: istClock(message.createdAt),
-          acknowledgedAt: message.acknowledgedAt,
+          readAt,
+          readBy: readName,
           overdue,
         }
       })
@@ -930,7 +935,8 @@ export function buildRecordsRouter({
         // Broadcasts created before batch ids fall back to a stable composite
         // key so their per-section rows still appear as one message.
         const key =
-          doc.batchId || `${doc.date}|${doc.sentAt}|${doc.title}|${doc.target}|${doc.sender}`
+          doc.batchId ||
+          `${doc.date}|${doc.sentAt}|${doc.title}|${doc.target}|${doc.sender || 'Admin / Coordinator'}`
         let group = groups.get(key)
         if (!group) {
           group = {
@@ -948,30 +954,58 @@ export function buildRecordsRouter({
             sentAtIst: istClock(doc.createdAt),
             createdAt: doc.createdAt,
             sections: [],
+            recipients: [],
             seen: 0,
             acknowledged: 0,
+            read: 0,
             teacherRead: 0,
             teacherTotal: 0,
           }
           groups.set(key, group)
         }
 
-        group.sections.push(`${doc.grade === 'PU1' ? '11' : '12'}${doc.section}`)
+        const label = `${doc.grade === 'PU1' ? '11' : '12'}${doc.section}`
+        group.sections.push(label)
+        // Per-section detail so the admin can open one message and see who was
+        // reached and who has read it.
+        group.recipients.push({
+          label,
+          grade: doc.grade,
+          section: doc.section,
+          seenAt: doc.seenAt || null,
+          readAt: doc.seenAt || doc.acknowledgedAt || null,
+          readBy: doc.seenBy || doc.acknowledgedBy || null,
+          teacherReadAt: null,
+          teacherReadBy: null,
+        })
         if (doc.seenAt) group.seen += 1
         if (doc.acknowledgedAt) group.acknowledged += 1
+        if (doc.seenAt || doc.acknowledgedAt) group.read += 1
       }
 
-      const batchIds = [...groups.values()]
-        .map((group) => group.batchId)
-        .filter(Boolean)
-
-      if (batchIds.length > 0) {
-        const notices = await TeacherNotice.find({ batchId: { $in: batchIds } }).lean()
+      // Class teacher read state lives on the matching notice row. Newer
+      // broadcasts link by batch id; older rows fall back to the same
+      // composite key used to group them.
+      const noticeDays = [...new Set([...groups.values()].map((group) => group.date).filter(Boolean))]
+      if (noticeDays.length > 0) {
+        const notices = await TeacherNotice.find({ date: { $in: noticeDays } }).lean()
         for (const notice of notices) {
-          const group = groups.get(notice.batchId)
+          const key =
+            notice.batchId ||
+            `${notice.date}|${notice.sentAt}|${notice.title}|${notice.target}|${
+              notice.sender || 'Admin / Coordinator'
+            }`
+          const group = groups.get(key)
           if (!group) continue
           group.teacherTotal += 1
           if (notice.readAt) group.teacherRead += 1
+          const recipient = group.recipients.find(
+            (row) => row.grade === notice.grade && row.section === notice.section
+          )
+          if (recipient) {
+            recipient.teacherReadAt = notice.readAt || null
+            recipient.teacherReadBy = notice.readBy || null
+          }
         }
       }
 
@@ -981,6 +1015,7 @@ export function buildRecordsRouter({
           ...group,
           sectionCount: group.sections.length,
           sectionsLabel: [...group.sections].sort().join(', '),
+          recipients: [...group.recipients].sort((a, b) => a.label.localeCompare(b.label)),
         }))
         .sort((a, b) => stamp(b).localeCompare(stamp(a)))
 
@@ -1002,6 +1037,7 @@ export function buildRecordsRouter({
 
   const inboxRow = (doc) => ({
     id: String(doc._id),
+    kind: 'inbox',
     title: doc.title,
     body: doc.body || '',
     fromName: doc.fromName || 'Daily Check',
@@ -1010,6 +1046,7 @@ export function buildRecordsRouter({
     sentAt: doc.sentAt,
     sentAtIst: istClock(doc.createdAt),
     readAt: doc.readAt || null,
+    readBy: doc.readBy || null,
     at: doc.createdAt ? new Date(doc.createdAt).toISOString() : null,
   })
 
@@ -1053,37 +1090,27 @@ export function buildRecordsRouter({
           (doc.grade === user.grade && doc.section === user.section)
       )
 
-      const readAt = istClock()
-      const readBy = user.name || INBOX_ROLE_LABEL[role] || 'Daily Check'
+      // Reading is per message: a row is only marked read when the user opens
+      // it, so the inbox behaves like a chat list.
       let unread = visible.filter((doc) => !doc.readAt).length
-
-      const unreadIds = visible.filter((doc) => !doc.readAt).map((doc) => doc._id)
-      if (unreadIds.length > 0) {
-        await InboxMessage.updateMany(
-          { _id: { $in: unreadIds } },
-          { $set: { readAt, readBy } }
-        )
-      }
-
       let items = visible.map(inboxRow)
 
       // The teacher inbox also carries the admin broadcasts and the leader's
       // notes, so one screen shows everything addressed to the class teacher.
       if (role === 'teacher') {
-        const [notices, notes, teacher] = await Promise.all([
+        const [notices, notes] = await Promise.all([
           TeacherNotice.find({ date, grade: user.grade, section: user.section }).lean(),
           LeaderNote.find({ date, grade: user.grade, section: user.section }).lean(),
-          teacherOf(user.grade, user.section),
         ])
 
-        const unreadNotices = notices.filter((notice) => !notice.readAt)
-        const unreadNotes = notes.filter((note) => !note.readAt)
-        unread += unreadNotices.length + unreadNotes.length
+        unread += notices.filter((notice) => !notice.readAt).length
+        unread += notes.filter((note) => !note.readAt).length
 
         items = [
           ...items,
           ...notices.map((notice) => ({
             id: String(notice._id),
+            kind: 'notice',
             title: notice.title,
             body: notice.body,
             fromName: notice.sender || 'Admin / Coordinator',
@@ -1092,10 +1119,12 @@ export function buildRecordsRouter({
             sentAt: notice.sentAt,
             sentAtIst: istClock(notice.createdAt),
             readAt: notice.readAt || null,
+            readBy: notice.readBy || null,
             at: notice.createdAt ? new Date(notice.createdAt).toISOString() : null,
           })),
           ...notes.map((note) => ({
             id: String(note._id),
+            kind: 'note',
             title: 'Note from the class leader',
             body: note.body,
             fromName: note.author,
@@ -1104,28 +1133,10 @@ export function buildRecordsRouter({
             sentAt: note.sentAt,
             sentAtIst: istClock(note.createdAt),
             readAt: note.readAt || null,
+            readBy: note.readBy || null,
             at: note.createdAt ? new Date(note.createdAt).toISOString() : null,
           })),
         ]
-
-        const updates = []
-        if (unreadNotices.length > 0) {
-          updates.push(
-            TeacherNotice.updateMany(
-              { _id: { $in: unreadNotices.map((notice) => notice._id) } },
-              { $set: { readAt, readBy: teacher } }
-            )
-          )
-        }
-        if (unreadNotes.length > 0) {
-          updates.push(
-            LeaderNote.updateMany(
-              { _id: { $in: unreadNotes.map((note) => note._id) } },
-              { $set: { readAt, readBy: teacher } }
-            )
-          )
-        }
-        if (updates.length > 0) await Promise.all(updates)
       }
 
       items.sort((a, b) =>
@@ -1133,6 +1144,83 @@ export function buildRecordsRouter({
       )
 
       res.json({ date, role, unread, messages: items })
+    })
+  )
+
+  // Opening one message marks that single row read. `kind` says which store
+  // the row came from; the role is always taken from the session.
+  router.post(
+    '/messages/inbox/:id/read',
+    api(async (req, res) => {
+      const user = req.user || {}
+      const role = user.role || 'admin'
+      const id = req.params.id
+      const kind = String(req.body?.kind || 'inbox').toLowerCase()
+      if (!/^[0-9a-f]{24}$/i.test(id)) throw httpError(400, 'Unknown message.')
+
+      const readAt = istClock()
+      const readBy = user.name || INBOX_ROLE_LABEL[role] || 'Daily Check'
+
+      if (kind === 'inbox') {
+        const doc = await InboxMessage.findOne({
+          _id: id,
+          toRole: { $in: [inboxRoleFor(role), 'ALL'] },
+        })
+        const otherSection =
+          doc?.grade &&
+          role === 'teacher' &&
+          (doc.grade !== user.grade || doc.section !== user.section)
+        if (!doc || otherSection) throw httpError(404, 'That message is not in your inbox.')
+        if (!doc.readAt) {
+          doc.readAt = readAt
+          doc.readBy = readBy
+          await doc.save()
+        }
+        res.json({ ok: true, kind, readAt: doc.readAt, readBy: doc.readBy })
+        return
+      }
+
+      if (kind === 'notice' || kind === 'note') {
+        if (role !== 'teacher') {
+          throw httpError(403, 'Only the class teacher can read that message.')
+        }
+        const Model = kind === 'notice' ? TeacherNotice : LeaderNote
+        const doc = await Model.findOne({ _id: id, grade: user.grade, section: user.section })
+        if (!doc) throw httpError(404, 'That message is not in your inbox.')
+        if (!doc.readAt) {
+          doc.readAt = readAt
+          doc.readBy = await teacherOf(user.grade, user.section)
+          await doc.save()
+        }
+        res.json({ ok: true, kind, readAt: doc.readAt, readBy: doc.readBy })
+        return
+      }
+
+      if (kind === 'leader') {
+        if (role !== 'leader') {
+          throw httpError(403, 'Only the class leader can read that message.')
+        }
+        const doc = await LeaderMessage.findOne({
+          _id: id,
+          grade: user.grade,
+          section: user.section,
+        })
+        if (!doc) throw httpError(404, 'That message is not in your inbox.')
+        if (!doc.seenAt) {
+          doc.seenAt = istClockSeconds()
+          doc.seenBy = user.name || 'Class Leader'
+          await doc.save()
+        }
+        res.json({
+          ok: true,
+          kind,
+          readAt: doc.seenAt || doc.acknowledgedAt || null,
+          readBy: doc.seenBy || doc.acknowledgedBy || null,
+        })
+        return
+      }
+
+      throw httpError(400, 'Unknown message.')
     })
   )
 
@@ -1276,20 +1364,23 @@ export function buildRecordsRouter({
         if (entryDoc?.submittedAt) entryStatus = entryPending > 0 ? 'in-progress' : 'complete'
 
         const sectionMessages = messagesBySection.get(key) || []
-        const acked = sectionMessages.filter((message) => message.acknowledgedAt).length
-        const overdue = sectionMessages.filter((message) => {
+        const readTimes = sectionMessages.map(
+          (message) => message.seenAt || message.acknowledgedAt || null
+        )
+        const read = readTimes.filter(Boolean).length
+        const overdue = sectionMessages.filter((message, index) => {
           const sent = toMinutes(message.sentAt)
-          const ack = toMinutes(message.acknowledgedAt)
-          const slow = ack !== null && ack - sent > ACK_WINDOW_MINUTES
-          return clock - sent > ACK_WINDOW_MINUTES && (ack === null || slow)
+          const readAt = toMinutes(readTimes[index])
+          const slow = readAt !== null && readAt - sent > ACK_WINDOW_MINUTES
+          return clock - sent > ACK_WINDOW_MINUTES && (readAt === null || slow)
         }).length
 
         const leaderAck =
           sectionMessages.length === 0
             ? 'no-messages'
-            : acked === sectionMessages.length
+            : read === sectionMessages.length
               ? 'yes'
-              : acked === 0
+              : read === 0
                 ? 'no'
                 : 'partial'
 
@@ -1314,7 +1405,7 @@ export function buildRecordsRouter({
             total: entryTotal,
           },
           nc: { count: ncCount, updatedInNe },
-          leaderAck: { status: leaderAck, sent: sectionMessages.length, acked, overdue },
+          leaderAck: { status: leaderAck, sent: sectionMessages.length, read, overdue },
           needsFollowUp:
             exitPending > 0 || entryStatus === 'pending' || ncCount === null || !updatedInNe,
         }
@@ -1342,25 +1433,16 @@ export function buildRecordsRouter({
     api(async (req, res) => {
       const { grade, section } = needSection(req.query)
       const date = req.query.date || todayIso()
+      const leader = await leaderOf(grade, section)
 
-      // Opening the inbox is what "seen" means; keep unacknowledged messages
-      // stamped so the class teacher can see the leader has read them. Only do
-      // this for today — browsing history must not rewrite an old day.
-      if (date === todayIso()) {
-        await LeaderMessage.updateMany(
-          { date, grade, section, acknowledgedAt: null, seenAt: null },
-          { $set: { seenAt: nowClock() } }
-        )
-      }
-
-      const [messages, leader] = await Promise.all([
-        LeaderMessage.find({ date, grade, section }).lean(),
-        leaderOf(grade, section),
-      ])
+      // A message is marked read only when the leader opens it (see
+      // POST /messages/inbox/:id/read), never just by listing the inbox.
+      const messages = await LeaderMessage.find({ date, grade, section }).lean()
 
       const list = messages
         .map((message) => ({
           id: String(message._id),
+          kind: 'leader',
           type: message.type,
           typeLabel: MESSAGE_TYPES[message.type] || message.type,
           title: message.title,
@@ -1370,10 +1452,10 @@ export function buildRecordsRouter({
           exitTime: message.exitTime || null,
           sentAt: message.sentAt,
           sentAtIst: istClock(message.createdAt),
-          status: message.acknowledgedAt ? 'acknowledged' : 'unread',
+          status: message.seenAt || message.acknowledgedAt ? 'read' : 'unread',
           seenAt: message.seenAt || null,
-          acknowledgedAt: message.acknowledgedAt,
-          acknowledgedBy: message.acknowledgedBy,
+          readAt: message.seenAt || message.acknowledgedAt || null,
+          readBy: message.seenBy || message.acknowledgedBy || null,
         }))
         .sort((a, b) => {
           if (a.status !== b.status) return a.status === 'unread' ? -1 : 1
@@ -1388,47 +1470,11 @@ export function buildRecordsRouter({
         leader: leader ? { rollNo: leader.rollNo, name: leader.name } : null,
         counts: {
           unread: list.filter((message) => message.status === 'unread').length,
-          acknowledged: list.filter((message) => message.status === 'acknowledged').length,
+          read: list.filter((message) => message.status === 'read').length,
           total: list.length,
         },
         messages: list,
       })
-    })
-  )
-
-  router.post(
-    '/inbox/:id/acknowledge',
-    api(async (req, res) => {
-      const { grade, section } = needSection(req.body || {})
-      if (!/^[0-9a-f]{24}$/i.test(req.params.id)) throw httpError(400, 'Unknown message.')
-
-      const message = await LeaderMessage.findOne({
-        _id: req.params.id,
-        grade,
-        section,
-      })
-      if (!message) throw httpError(404, 'That message is not in this section’s inbox.')
-      if (message.acknowledgedAt) {
-        throw httpError(400, 'This message is already acknowledged and locked.')
-      }
-      if (message.date !== todayIso()) {
-        throw httpError(400, 'Messages can only be acknowledged on the day they were sent.')
-      }
-
-      const leader = await leaderOf(grade, section)
-      if (!leader) throw httpError(400, 'No class leader is on record for this section.')
-
-      const at = clockSeconds()
-      message.acknowledgedAt = at
-      message.acknowledgedBy = leader.name
-      await message.save()
-
-      await writeAudit(
-        AuditLog,
-        'Message acknowledged',
-        `${grade}/${section} — ${leader.name} at ${at} (${message.title})`
-      )
-      res.json({ ok: true, acknowledgedAt: at, acknowledgedBy: leader.name })
     })
   )
 
@@ -1534,7 +1580,9 @@ export function buildRecordsRouter({
         }))
 
       const exitOpen = exit.filter((row) => ['pending', 'acknowledged'].includes(row.status))
-      const unread = messages.filter((message) => !message.acknowledgedAt).length
+      const unread = messages.filter(
+        (message) => !message.seenAt && !message.acknowledgedAt
+      ).length
       // Only the class teacher's own message satisfies the daily-check block;
       // admin broadcasts also live in LeaderMessage and must not count.
       const fromTeacher = messages.filter((message) => message.sender === teacher)
@@ -1748,10 +1796,9 @@ export function buildRecordsRouter({
 
   const messageStatus = (message, clock) => {
     if (!message) return null
-    if (message.acknowledgedAt) return 'acknowledged'
+    if (message.seenAt || message.acknowledgedAt) return 'read'
     const sent = toMinutes(message.sentAt)
     if (clock - sent > ACK_WINDOW_MINUTES) return 'overdue'
-    if (message.seenAt) return 'seen'
     return 'sent'
   }
 

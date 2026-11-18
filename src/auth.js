@@ -158,7 +158,7 @@ export function authorize(req, res, next) {
   const path = req.path
   // Every dashboard shares one inbox endpoint; the server decides which rows
   // the signed-in role may see.
-  if (path === '/messages/inbox') {
+  if (path === '/messages/inbox' || path.startsWith('/messages/inbox/')) {
     next()
     return
   }
@@ -167,9 +167,7 @@ export function authorize(req, res, next) {
     (role === 'teacher' && path.startsWith('/teacher/')) ||
     (role === 'transport' && path.startsWith('/transport/')) ||
     (role === 'leader' &&
-      (path.startsWith('/leader/') ||
-        path === '/inbox' ||
-        /^\/inbox\/[0-9a-f]{24}\/acknowledge$/i.test(path))) ||
+      (path.startsWith('/leader/') || path === '/inbox')) ||
     (role === 'gate' &&
       (path.startsWith('/gate/') ||
         path === '/students/search' ||
