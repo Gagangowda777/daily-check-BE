@@ -197,6 +197,8 @@ export function buildRecordsRouter({
       const isToday = date === todayIso()
       // Past days are complete, so every clock window has already elapsed.
       const clock = isToday ? clockNow() : 24 * 60
+      const settings = await loadSettings(Settings)
+      const cutoffMin = toMinutes(settings.busCutoff)
 
       const sectionFilter = {}
       if (match.grade) sectionFilter.grade = match.grade
@@ -205,7 +207,7 @@ export function buildRecordsRouter({
       const exitMatch = { ...match, restrictionType: 'exit' }
       const entryMatch = { ...match, restrictionType: 'entry' }
 
-      const [busRoutes, entrySections, messages, exitRows, entryRows, handover, exitGroups, entryGroups, busLateGroups] =
+      const [busRoutes, entrySections, messages, exitRows, entryRows, handover, exitGroups, entryGroups, busLateGroups, routeRiderGroups] =
         await Promise.all([
           BusLog.find({ date }).sort({ route: 1 }).lean(),
           EntrySection.find({ date, ...sectionFilter }).sort({ grade: 1, section: 1 }).lean(),
@@ -227,6 +229,17 @@ export function buildRecordsRouter({
             { $match: { date, busLate: true } },
             { $group: { _id: '$busRoute', count: { $sum: 1 } } },
           ]),
+          DailyRecord.aggregate([
+            {
+              $match: {
+                date,
+                ...sectionFilter,
+                busRoute: { $ne: null },
+                rider: { $ne: false },
+              },
+            },
+            { $group: { _id: '$busRoute', count: { $sum: 1 } } },
+          ]),
         ])
 
       // Route codes are strings, so sort numerically (R1, R2, … R10).
@@ -236,10 +249,14 @@ export function buildRecordsRouter({
       // affected count comes from the students actually marked late — the
       // stored BusLog.late/affectedStudents are only the last computed values.
       const busLateMap = new Map(busLateGroups.map((group) => [group._id, group.count]))
-      const effectiveLate = (route) =>
-        route.overrideLate === true || route.overrideLate === false
-          ? route.overrideLate
-          : Boolean(route.late)
+      const routeRiderMap = new Map(routeRiderGroups.map((group) => [group._id, group.count]))
+      // Late status follows the live 8:20 cut-off (or a transport override), so
+      // the KPI card cannot drift from the transport screen.
+      const effectiveLate = (route) => {
+        if (route.overrideLate === true || route.overrideLate === false) return route.overrideLate
+        const arrival = toMinutes(route.arrivalTime)
+        return arrival !== null && arrival > cutoffMin
+      }
       const hasOverride = (route) => route.overrideLate === true || route.overrideLate === false
 
       const lateRoutes = busRoutes.filter(effectiveLate)
@@ -285,9 +302,10 @@ export function buildRecordsRouter({
           totalRoutes: busRoutes.length,
           lateRoutes: lateRoutes.length,
           affectedStudents: lateRoutes.reduce(
-            (sum, route) => sum + (busLateMap.get(route.route) || 0),
+            (sum, route) => sum + (routeRiderMap.get(route.route) || 0),
             0
           ),
+          cutoff: settings.busCutoff,
           notArrived: notArrived.map((route) => ({
             route: route.route,
             affectedStudents: busLateMap.get(route.route) || 0,
@@ -1487,8 +1505,7 @@ export function buildRecordsRouter({
 
   const busTiming = (busRoutes, settings) => {
     const busByRoute = new Map(busRoutes.map((route) => [route.route, route]))
-    const cutoff = toMinutes(settings.busCutoff) || toMinutes('08:45')
-    const minutesFrom = (bus) => toMinutes(bus?.scheduledTime) ?? cutoff
+    const cutoff = toMinutes(settings.busCutoff) || toMinutes('08:20')
     return (record) => {
       const bus = busByRoute.get(record.busRoute)
       const arrival = toMinutes(bus?.arrivalTime)
@@ -1500,7 +1517,7 @@ export function buildRecordsRouter({
         minutesLate:
           arrival === null || arrival === undefined
             ? null
-            : Math.max(0, arrival - minutesFrom(bus)),
+            : Math.max(0, arrival - cutoff),
       }
     }
   }
@@ -1542,8 +1559,22 @@ export function buildRecordsRouter({
       const attendance = { present: 0, late: 0, absent: 0 }
       for (const record of records) attendance[record.attendance] += 1
 
+      // Derive lateness from the bus arrival against today's cut-off so every
+      // dashboard agrees with transport, even after the cut-off is changed.
+      const cutoffMin = toMinutes(settings.busCutoff)
+      const lateRoutes = new Set(
+        busRoutes
+          .filter((bus) => {
+            if (bus.overrideLate === true) return true
+            if (bus.overrideLate === false) return false
+            const arrival = toMinutes(bus.arrivalTime)
+            return arrival !== null && arrival > cutoffMin
+          })
+          .map((bus) => bus.route)
+      )
+
       const lateBuses = records
-        .filter((record) => record.busLate)
+        .filter((record) => record.rider !== false && lateRoutes.has(record.busRoute))
         .map(toLateBus)
         .sort((a, b) => (b.minutesLate || 0) - (a.minutesLate || 0))
 
@@ -1824,11 +1855,24 @@ export function buildRecordsRouter({
       ])
 
       const busByRoute = new Map(busRoutes.map((route) => [route.route, route]))
-      const cutoff = toMinutes(settings.busCutoff) || toMinutes('08:45')
-      const minutesFrom = (bus) => toMinutes(bus?.scheduledTime) ?? cutoff
+      const cutoff = toMinutes(settings.busCutoff) || toMinutes('08:20')
+      const cutoffMin = cutoff
+
+      // Lateness follows the bus arrival against the 8:20 cut-off (or the
+      // transport override), not a stored per-student flag.
+      const lateRoutes = new Set(
+        busRoutes
+          .filter((bus) => {
+            if (bus.overrideLate === true) return true
+            if (bus.overrideLate === false) return false
+            const arrival = toMinutes(bus.arrivalTime)
+            return arrival !== null && arrival > cutoffMin
+          })
+          .map((bus) => bus.route)
+      )
 
       const lateBuses = records
-        .filter((record) => record.busLate)
+        .filter((record) => record.rider !== false && lateRoutes.has(record.busRoute))
         .map((record) => {
           const bus = busByRoute.get(record.busRoute)
           const arrival = toMinutes(bus?.arrivalTime)
@@ -1840,7 +1884,7 @@ export function buildRecordsRouter({
             minutesLate:
               arrival === null || arrival === undefined
                 ? null
-                : Math.max(0, arrival - minutesFrom(bus)),
+                : Math.max(0, arrival - cutoffMin),
           }
         })
         .sort((a, b) => (b.minutesLate || 0) - (a.minutesLate || 0))
@@ -2285,7 +2329,7 @@ export function buildRecordsRouter({
   const TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/
 
   const routeCutoffFor = (settings, route) =>
-    settings.routeCutoffs?.[route] || settings.busCutoff || '08:45'
+    settings.routeCutoffs?.[route] || settings.busCutoff || '08:20'
 
   // Students on a route absorb that route's late status, unless they were
   // unticked as absent riders.
@@ -2327,7 +2371,9 @@ export function buildRecordsRouter({
           name: student.name,
           section: `${student.grade === 'PU1' ? '11' : '12'}${student.section}`,
           rider: student.rider !== false,
-          busLate: Boolean(student.busLate),
+          // Late comes from the route arrival against the live cut-off, so a
+          // student is never flagged from an outdated stored value.
+          busLate: Boolean(late) && student.rider !== false,
         }))
 
       return {
@@ -2645,7 +2691,7 @@ export function buildRecordsRouter({
         arrivalTime: route.arrivalTime,
         status: route.status,
         studentsOnRoute: route.riders,
-        lateStudents: route.students.filter((student) => student.rider && student.busLate).length,
+        lateStudents: route.late ? route.riders : 0,
         override: route.override,
       }))
 
@@ -2662,7 +2708,23 @@ export function buildRecordsRouter({
       const bus = await BusLog.findOne({ date: day, route }).lean()
       if (!bus) throw httpError(404, 'That route has no log for this date.')
 
-      const lateStudents = await DailyRecord.find({ date: day, busRoute: route, busLate: true })
+      const settings = await loadSettings(Settings)
+      const cutoff = routeCutoffFor(settings, route)
+      const cutoffMin = toMinutes(cutoff)
+      const arrivalMin = toMinutes(bus.arrivalTime)
+      const overridden = bus.overrideLate === true || bus.overrideLate === false
+      const late = overridden ? bus.overrideLate : arrivalMin !== null && arrivalMin > cutoffMin
+      if (!late) {
+        throw httpError(400, `That route is not late against the ${cutoff} cut-off.`)
+      }
+
+      // Select by route and rider, not the stored flag, so routes that became
+      // late when the cut-off moved to 08:20 can still be converted.
+      const lateStudents = await DailyRecord.find({
+        date: day,
+        busRoute: route,
+        rider: { $ne: false },
+      })
         .select('rollNo restrictionType')
         .lean()
       if (lateStudents.length === 0) throw httpError(400, 'No late students on this route.')
@@ -2679,13 +2741,17 @@ export function buildRecordsRouter({
         )
       }
 
-      const settings = await loadSettings(Settings)
       const reason = settings.exitReasons.includes('Late to college')
         ? 'Late to college'
         : settings.exitReasons[0]
 
       await DailyRecord.updateMany(
-        { date: day, busRoute: route, busLate: true, restrictionType: { $ne: 'entry' } },
+        {
+          date: day,
+          busRoute: route,
+          rider: { $ne: false },
+          restrictionType: { $ne: 'entry' },
+        },
         {
           $set: {
             restrictionType: 'exit',
@@ -2963,6 +3029,36 @@ export function buildRecordsRouter({
           .then((rows) => rows.sort((a, b) => byRoute(a.route, b.route))),
       ])
 
+      // The gate shows the same live lateness as transport, based on the 8:20
+      // cut-off rather than the last stored flag.
+      const settings = await loadSettings(Settings)
+      const cutoffMin = toMinutes(settings.busCutoff)
+      const busRiders = await DailyRecord.find({ date, busRoute: { $ne: null } })
+        .select('rollNo name grade section busRoute rider')
+        .lean()
+      const buses = busLogs.map((bus) => {
+        const arrival = toMinutes(bus.arrivalTime)
+        const overridden = bus.overrideLate === true || bus.overrideLate === false
+        const late = overridden
+          ? bus.overrideLate
+          : arrival !== null && arrival > cutoffMin
+        const students = busRiders
+          .filter((record) => record.busRoute === bus.route && record.rider !== false)
+          .sort((a, b) => a.rollNo.localeCompare(b.rollNo))
+          .map((record) => ({
+            rollNo: record.rollNo,
+            name: record.name,
+            classLabel: `${record.grade === 'PU1' ? '11' : '12'}${record.section}`,
+          }))
+        return {
+          ...bus,
+          late,
+          students,
+          affectedStudents: students.length,
+          scheduledTime: bus.scheduledTime || settings.busCutoff,
+        }
+      })
+
       const passesMap = new Map()
 
       for (const msg of authMessages) {
@@ -3059,9 +3155,9 @@ export function buildRecordsRouter({
         blockedAttempts: gateLogs.filter((l) => l.type === 'blocked_attempt').length,
         totalLogs: gateLogs.length,
         buses: {
-          total: busLogs.length,
-          arrived: busLogs.filter((b) => b.arrivalTime !== null).length,
-          late: busLogs.filter((b) => b.late || b.overrideLate).length,
+          total: buses.length,
+          arrived: buses.filter((b) => b.arrivalTime !== null).length,
+          late: buses.filter((b) => b.late).length,
         },
       }
 
@@ -3071,7 +3167,7 @@ export function buildRecordsRouter({
         passes: passList,
         restrictions: restrictionsList,
         logs: gateLogs,
-        buses: busLogs,
+        buses,
       })
     })
   )

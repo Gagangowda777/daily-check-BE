@@ -22,7 +22,7 @@ export const DEFAULT_ENTRY_SUBJECTS = [
   'All Subjects',
 ]
 
-export const DEFAULT_BUS_CUTOFF = '08:45'
+export const DEFAULT_BUS_CUTOFF = '08:20'
 
 export const ROLE_LABELS = {
   admin: 'Admin / Coordinator',

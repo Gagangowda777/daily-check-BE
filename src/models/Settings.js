@@ -7,7 +7,7 @@ const settingsSchema = new mongoose.Schema(
     key: { type: String, required: true, unique: true, default: 'main' },
     exitReasons: { type: [String], default: [] },
     entrySubjects: { type: [String], default: [] },
-    busCutoff: { type: String, default: '08:45' },
+    busCutoff: { type: String, default: '08:20' },
     routeCutoffs: { type: Map, of: String, default: {} },
   },
   { timestamps: true }

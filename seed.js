@@ -334,7 +334,7 @@ async function main() {
     exitReasons: [...DEFAULT_EXIT_REASONS],
     entrySubjects: [...DEFAULT_ENTRY_SUBJECTS],
     busCutoff: DEFAULT_BUS_CUTOFF,
-    routeCutoffs: { R3: '08:30', R11: '09:00' },
+    routeCutoffs: {},
   })
   console.log('[seed] settings created')
 
@@ -452,7 +452,7 @@ async function main() {
       action: index % 2 === 0 ? 'Settings updated' : 'Message sent',
       detail:
         index % 2 === 0
-          ? 'cutoff 08:45 · 8 reasons · 2 route overrides'
+          ? 'cutoff 08:20 · 8 reasons · no route overrides'
           : 'Update → PU1 (17 section(s))',
     }))
   )
