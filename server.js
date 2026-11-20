@@ -17,6 +17,7 @@ import GateLog from './src/models/GateLog.js'
 import DailyNote from './src/models/DailyNote.js'
 import SectionNc from './src/models/SectionNc.js'
 import InboxMessage from './src/models/InboxMessage.js'
+import Announcement from './src/models/Announcement.js'
 import { buildRecordsRouter } from './src/routes.js'
 import {
   buildAuthRouter,
@@ -25,6 +26,7 @@ import {
   scopeToUser,
 } from './src/auth.js'
 import { ensureDay } from './src/day.js'
+import { startRetention } from './src/retention.js'
 import { todayIso } from './src/defaults.js'
 
 const app = express()
@@ -61,7 +63,9 @@ app.use(
     },
   })
 )
-app.use(express.json({ limit: '1mb' }))
+// Announcement photos arrive as a data URL from the camera, so the body limit
+// is wide enough for one resized photo.
+app.use(express.json({ limit: '8mb' }))
 
 // Hosts like Render inject a real PORT. The desktop runner injects PORT=0,
 // which must not win, and the local .env uses API_PORT.
@@ -107,6 +111,7 @@ app.use(
     DailyNote,
     SectionNc,
     InboxMessage,
+    Announcement,
   })
 )
 
@@ -127,7 +132,7 @@ async function start() {
   if (isConnected()) {
     const students = await Student.estimatedDocumentCount()
     if (students === 0) {
-      console.warn('[api] roster is empty — run `npm run seed`')
+      console.warn('[api] roster is empty: run `npm run seed`')
     } else {
       // Roll the day forward in the background so the first screen is ready.
       ensureDay({ Student, DailyRecord, BusLog }, todayIso()).catch((error) =>
@@ -137,6 +142,10 @@ async function start() {
   }
 
   app.listen(PORT, () => console.log(`[api] listening on http://localhost:${PORT}`))
+
+  // Excel-fed rows are archived and deleted once they are older than
+  // RETENTION_DAYS; the first pass runs shortly after boot.
+  if (isConnected()) startRetention()
 }
 
 start()

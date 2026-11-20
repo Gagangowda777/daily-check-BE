@@ -1,6 +1,8 @@
 import express from 'express'
 import { randomUUID } from 'node:crypto'
 import { ensureDay } from './day.js'
+import { uploadImage } from './cloudinary.js'
+import DayArchive from './models/DayArchive.js'
 import {
   DEFAULT_BUS_CUTOFF,
   DEFAULT_ENTRY_SUBJECTS,
@@ -51,6 +53,10 @@ const MESSAGE_TYPES = {
   'authorized-exit': 'Authorized Exit',
   broadcast: 'Broadcast',
 }
+
+// Names used on the admin desk. Older leader rows carry no fromRole, so a row
+// whose sender is not one of these desks is treated as the class teacher's.
+const ADMIN_SENDERS = new Set(['Admin / Coordinator', 'Super Admin'])
 
 const INBOX_ROLE_LABEL = {
   admin: 'Admin / Coordinator',
@@ -164,12 +170,108 @@ export function buildRecordsRouter({
   GateLog,
   DailyNote,
   SectionNc,
+  Announcement,
 }) {
   const router = express.Router()
 
   // Any screen that reads today can safely ask for the day to exist first.
   // Memory-cached, so it is a no-op after the first call.
   const ensureToday = () => ensureDay({ Student, DailyRecord, BusLog })
+
+  // ---- announcement photos ------------------------------------------------
+
+  const announcementOut = (doc) => ({
+    id: String(doc._id),
+    caption: doc.caption || '',
+    photoUrl: doc.photoUrl,
+    author: doc.authorName,
+    authorRole: doc.authorRole,
+    context: doc.context || null,
+    date: doc.createdAt
+      ? new Date(doc.createdAt).toLocaleDateString('en-CA', { timeZone: IST })
+      : '',
+    atIst: doc.createdAt ? istClock(doc.createdAt) : '',
+    createdAt: doc.createdAt,
+  })
+
+  // Snapshots taken before a past day's Excel rows were deleted, newest
+  // first. The Broadcast screen shows these as proof of what was archived.
+  router.get(
+    '/archives',
+    api(async (req, res) => {
+      const docs = await DayArchive.find({}).sort({ date: -1 }).limit(120).lean()
+      res.json({
+        archives: docs.map((doc) => ({
+          id: String(doc._id),
+          date: doc.date,
+          url: doc.url,
+          rows: doc.rows || 0,
+          counts: doc.counts || {},
+          deletedAt: doc.deletedAt || null,
+        })),
+      })
+    })
+  )
+
+  router.get(
+    '/announcements',
+    api(async (req, res) => {
+      const docs = await Announcement.find({})
+        .sort({ createdAt: -1 })
+        .limit(60)
+        .lean()
+      res.json({ announcements: docs.map(announcementOut) })
+    })
+  )
+
+  // The camera sends a resized JPEG as a data URL; the API uploads it to
+  // Cloudinary and keeps only the address, so the photo never sits in Mongo.
+  router.post(
+    '/announcements',
+    api(async (req, res) => {
+      const { image, caption = '' } = req.body || {}
+      const text = String(caption).trim()
+      if (text.length > 1000) throw httpError(400, 'Keep the announcement under 1000 characters.')
+
+      const match = String(image || '').match(
+        /^data:image\/(png|jpe?g|webp);base64,([A-Za-z0-9+/=]+)$/
+      )
+      if (!match) throw httpError(400, 'Take or choose a photo to post.')
+
+      const bytes = Buffer.from(match[2], 'base64')
+      if (bytes.length > 6 * 1024 * 1024) {
+        throw httpError(413, 'That photo is too large. Take it again.')
+      }
+
+      const mime =
+        match[1] === 'png' ? 'image/png' : match[1] === 'webp' ? 'image/webp' : 'image/jpeg'
+      const upload = await uploadImage(bytes, {
+        folder: 'daily-check/announcements',
+        mime,
+      })
+
+      const role = req.user?.role
+      const doc = await Announcement.create({
+        caption: text,
+        photoUrl: upload.url,
+        photoPublicId: upload.publicId,
+        authorRole: role,
+        authorName: INBOX_ROLE_LABEL[role] || role,
+        authorEmail: req.user?.email || null,
+        context:
+          role === 'teacher'
+            ? `${classLabelOf(req.user.grade, req.user.section)} · Class Teacher`
+            : null,
+      })
+
+      await writeAudit(
+        AuditLog,
+        'Announcement photo posted',
+        `${INBOX_ROLE_LABEL[role] || role}: ${upload.url}`
+      )
+      res.status(201).json({ announcement: announcementOut(doc.toObject()) })
+    })
+  )
 
   router.get(
     '/filters',
@@ -249,7 +351,7 @@ export function buildRecordsRouter({
       busRoutes.sort((a, b) => Number(a.route.slice(1)) - Number(b.route.slice(1)))
 
       // A manual transport override wins over the computed lateness, and the
-      // affected count comes from the students actually marked late — the
+      // affected count comes from the students actually marked late: the
       // stored BusLog.late/affectedStudents are only the last computed values.
       const busLateMap = new Map(busLateGroups.map((group) => [group._id, group.count]))
       const routeRiderMap = new Map(routeRiderGroups.map((group) => [group._id, group.count]))
@@ -413,7 +515,7 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         'Exit restriction added',
-        `${student.rollNo} — ${reason}${untilResolved ? ' (until resolved)' : ` until ${endDate}`}`
+        `${student.rollNo}: ${reason}${untilResolved ? ' (until resolved)' : ` until ${endDate}`}`
       )
       res.status(201).json({ date: day, student, record })
     })
@@ -466,7 +568,7 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         'Entry restriction added',
-        `${student.rollNo} — ${picked.join(', ')}`
+        `${student.rollNo}: ${picked.join(', ')}`
       )
       res.status(201).json({ date: day, student, record })
     })
@@ -693,7 +795,7 @@ export function buildRecordsRouter({
         { upsert: true }
       )
 
-      await writeAudit(AuditLog, 'Student created', `${normRoll} — ${student.name} (${normGrade}/${normSection})`)
+      await writeAudit(AuditLog, 'Student created', `${normRoll}: ${student.name} (${normGrade}/${normSection})`)
       res.status(201).json({ ok: true, student })
     })
   )
@@ -817,7 +919,7 @@ export function buildRecordsRouter({
         }
       )
 
-      await writeAudit(AuditLog, 'Student updated', `${rollNo} — ${student.name}`)
+      await writeAudit(AuditLog, 'Student updated', `${rollNo}: ${student.name}`)
       res.json({ ok: true, student })
     })
   )
@@ -1208,29 +1310,44 @@ export function buildRecordsRouter({
       // A class leader's chat is the section's leader messages (admin
       // broadcasts and teacher updates) plus anything the leader sent back.
       if (role === 'leader') {
-        const leaderDocs = await LeaderMessage.find({
-          ...scope,
-          grade: user.grade,
-          section: user.section,
-        }).lean()
+        const [leaderDocs, sectionDoc] = await Promise.all([
+          LeaderMessage.find({
+            ...scope,
+            grade: user.grade,
+            section: user.section,
+          }).lean(),
+          Section.findOne({ grade: user.grade, section: user.section })
+            .select('teacher')
+            .lean(),
+        ])
+        const classTeacher = sectionDoc?.teacher || null
         items = [
           ...items,
-          ...leaderDocs.map((message) => ({
-            id: String(message._id),
-            kind: 'leader',
-            title: message.title,
-            body: message.body || message.title,
-            fromName: message.sender || 'Admin / Coordinator',
-            fromRole: message.fromRole === 'teacher' ? 'teacher' : 'admin',
-            toRole: null,
-            fromContext: message.sender || null,
-            sentAt: message.sentAt,
-            sentAtIst: istClock(message.createdAt),
-            readAt: message.seenAt || message.acknowledgedAt || null,
-            readBy: message.seenBy || message.acknowledgedBy || null,
-            at: message.createdAt ? new Date(message.createdAt).toISOString() : null,
-            mine: false,
-          })),
+          ...leaderDocs.map((message) => {
+            // Older rows predate fromRole, so the section's class teacher is
+            // used as the second signal for who sent the message.
+            const fromTeacher =
+              message.fromRole === 'teacher' ||
+              (Boolean(message.sender) && message.sender === classTeacher)
+            return {
+              id: String(message._id),
+              kind: 'leader',
+              title: message.title,
+              body: message.body || message.title,
+              fromName: message.sender || 'Admin / Coordinator',
+              fromRole: fromTeacher ? 'teacher' : 'admin',
+              toRole: null,
+              fromContext: fromTeacher
+                ? message.sender
+                : message.sender || 'Admin / Coordinator',
+              sentAt: message.sentAt,
+              sentAtIst: istClock(message.createdAt),
+              readAt: message.seenAt || message.acknowledgedAt || null,
+              readBy: message.seenBy || message.acknowledgedBy || null,
+              at: message.createdAt ? new Date(message.createdAt).toISOString() : null,
+              mine: false,
+            }
+          }),
         ]
         unread += leaderDocs.filter((message) => !message.seenAt && !message.acknowledgedAt).length
       }
@@ -1352,8 +1469,10 @@ export function buildRecordsRouter({
       let delivered = 0
 
       // A class teacher messaging the leader writes the same row the leader
-      // inbox reads, so the daily-check message block is satisfied too.
-      if (to === 'LEADER') {
+      // inbox reads, so the daily-check message block is satisfied too. An
+      // admin or super admin has no single section, so their message reaches
+      // every leader through the shared inbox row below instead.
+      if (to === 'LEADER' && role === 'teacher') {
         await LeaderMessage.create({
           date: day,
           grade: user.grade,
@@ -1372,7 +1491,9 @@ export function buildRecordsRouter({
       }
 
       const docs = targets
-        .filter((target) => (to === 'LEADER' ? target !== 'LEADER' : true))
+        .filter((target) =>
+          to === 'LEADER' && role === 'teacher' ? target !== 'LEADER' : true
+        )
         .map((toRole) => ({
           date: day,
           title,
@@ -1788,7 +1909,7 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         'Attendance marked',
-        `${grade}/${section} — ${rollNo} ${status} by ${leader}`
+        `${grade}/${section}: ${rollNo} ${status} by ${leader}`
       )
 
       res.json({ ok: true, date, rollNo, attendance: status })
@@ -1801,10 +1922,14 @@ export function buildRecordsRouter({
     api(async (req, res) => {
       const { grade, section } = needSection(req.query)
       const days = Math.min(Math.max(Number(req.query.days) || 7, 3), 14)
-      const since = isoDaysAgo(days * 2 + 2)
+      // The trend ends on the selected date, so older windows stay reachable.
+      const end = req.query.date || todayIso()
+      const sinceDate = new Date(`${end}T12:00:00`)
+      sinceDate.setDate(sinceDate.getDate() - (days * 2 + 2))
+      const since = sinceDate.toLocaleDateString('en-CA')
 
       const groups = await DailyRecord.aggregate([
-        { $match: { grade, section, date: { $gte: since, $lte: todayIso() } } },
+        { $match: { grade, section, date: { $gte: since, $lte: end } } },
         {
           $group: {
             _id: '$date',
@@ -1888,7 +2013,7 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         'Leader note sent',
-        `${grade}/${section} — ${author}: ${body.slice(0, 80)}`
+        `${grade}/${section}: ${author}: ${body.slice(0, 80)}`
       )
 
       res.json({ ok: true, note: noteRow(note) })
@@ -1924,7 +2049,7 @@ export function buildRecordsRouter({
     api(async (req, res) => {
       await ensureToday()
       const { grade, section } = needSection(req.query)
-      const date = todayIso()
+      const date = req.query.date || todayIso()
       const settings = await loadSettings(Settings)
 
       // The "class leader message" block is the teacher's own message. Admin
@@ -2222,7 +2347,7 @@ export function buildRecordsRouter({
         { date: day, rollNo, restrictionType: 'exit' },
         { $set: { resolutionStatus: 'absent', resolutionNote: reason, resolvedOn: null } }
       )
-      await writeAudit(AuditLog, 'Exit marked absent', `${rollNo} — ${reason}`)
+      await writeAudit(AuditLog, 'Exit marked absent', `${rollNo}: ${reason}`)
       res.json({ ok: true })
     })
   )
@@ -2249,7 +2374,7 @@ export function buildRecordsRouter({
           },
         }
       )
-      await writeAudit(AuditLog, 'Exit excused', `${rollNo} — ${approver}`)
+      await writeAudit(AuditLog, 'Exit excused', `${rollNo}: ${approver}`)
       res.json({ ok: true })
     })
   )
@@ -2268,7 +2393,7 @@ export function buildRecordsRouter({
         { date: day, rollNo, restrictionType: 'exit' },
         { $set: { resolutionStatus: 'resolved', resolvedOn: day, resolutionNote: note } }
       )
-      await writeAudit(AuditLog, 'Exit resolved', `${rollNo} — ${note}`)
+      await writeAudit(AuditLog, 'Exit resolved', `${rollNo}: ${note}`)
       res.json({ ok: true })
     })
   )
@@ -2295,14 +2420,14 @@ export function buildRecordsRouter({
             restrictionReason: remaining.join(', ') || record.restrictionReason,
             resolutionStatus: remaining.length === 0 ? 'resolved' : 'pending',
             resolvedOn: remaining.length === 0 ? day : null,
-            resolutionNote: remaining.length === 0 ? 'Submitted — all subjects cleared' : null,
+            resolutionNote: remaining.length === 0 ? 'Submitted: all subjects cleared' : null,
           },
         }
       )
       await writeAudit(
         AuditLog,
         'Entry submitted',
-        `${rollNo} — cleared ${cleared.join(', ') || 'none'}; ${remaining.length} subject(s) left`
+        `${rollNo}: cleared ${cleared.join(', ') || 'none'}; ${remaining.length} subject(s) left`
       )
       res.json({ ok: true, remaining })
     })
@@ -2323,7 +2448,7 @@ export function buildRecordsRouter({
           },
         }
       )
-      await writeAudit(AuditLog, 'Entry marked absent', `${rollNo}${note ? ` — ${note}` : ''}`)
+      await writeAudit(AuditLog, 'Entry marked absent', `${rollNo}${note ? `: ${note}` : ''}`)
       res.json({ ok: true })
     })
   )
@@ -2344,7 +2469,7 @@ export function buildRecordsRouter({
           },
         }
       )
-      await writeAudit(AuditLog, 'Handed over to admin', `${rollNo}${note ? ` — ${note}` : ''}`)
+      await writeAudit(AuditLog, 'Handed over to admin', `${rollNo}${note ? `: ${note}` : ''}`)
       res.json({ ok: true })
     })
   )
@@ -2364,7 +2489,7 @@ export function buildRecordsRouter({
         { $set: { ncCount: Math.round(count), updatedInNe: Boolean(req.body?.updatedInNe) } },
         { upsert: true, new: true, setDefaultsOnInsert: true }
       )
-      await writeAudit(AuditLog, 'NC updated', `${grade}/${section} — ${Math.round(count)} NC`)
+      await writeAudit(AuditLog, 'NC updated', `${grade}/${section}: ${Math.round(count)} NC`)
       res.json({ ok: true })
     })
   )
@@ -2377,7 +2502,7 @@ export function buildRecordsRouter({
       const teacher = await teacherOf(grade, section)
 
       // Closing the day is the teacher's 4/4 checkpoint, so every block must
-      // actually be finished — not just the entry checks.
+      // actually be finished: not just the entry checks.
       const [pendingEntry, openExit, entryDoc, message] = await Promise.all([
         DailyRecord.countDocuments({
           date,
@@ -2398,12 +2523,12 @@ export function buildRecordsRouter({
       ])
 
       if (pendingEntry > 0) {
-        throw httpError(400, `${pendingEntry} student(s) still to verify — close the entry check first.`)
+        throw httpError(400, `${pendingEntry} student(s) still to verify: close the entry check first.`)
       }
       if (openExit > 0) {
         throw httpError(
           400,
-          `${openExit} exit restriction(s) still open — acknowledge and resolve them first.`
+          `${openExit} exit restriction(s) still open: acknowledge and resolve them first.`
         )
       }
       if (entryDoc?.ncCount === null || entryDoc?.ncCount === undefined) {
@@ -2467,7 +2592,7 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         'Attendance marked',
-        `${rollNo} ${status}${withNc ? ` with NC — ${ncReason}` : ''} by ${teacher} (${section})`
+        `${rollNo} ${status}${withNc ? ` with NC: ${ncReason}` : ''} by ${teacher} (${section})`
       )
       res.json({ ok: true, rollNo, attendance: status, ncFlag: withNc })
     })
@@ -2512,7 +2637,7 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         'Admin upload announced',
-        `${grade}/${section} — ${uploaded} row(s) by ${teacher}`
+        `${grade}/${section}: ${uploaded} row(s) by ${teacher}`
       )
       res.json({ ok: true, announcedAt: at, announcedBy: teacher })
     })
@@ -2579,7 +2704,7 @@ export function buildRecordsRouter({
         seenAt: null,
         acknowledgedAt: null,
       })
-      await writeAudit(AuditLog, 'Class leader message', `${grade}/${section} — ${MESSAGE_TYPES[type]}`)
+      await writeAudit(AuditLog, 'Class leader message', `${grade}/${section}: ${MESSAGE_TYPES[type]}`)
       res.status(201).json({ ok: true, sentAt: message.sentAt })
     })
   )
@@ -2697,7 +2822,7 @@ export function buildRecordsRouter({
       if (!TIME_PATTERN.test(time)) throw httpError(400, 'Use a time like 09:05.')
 
       const { late, cutoff } = await logArrival(route, date, time)
-      await writeAudit(AuditLog, 'Bus arrival logged', `${route} at ${time} — ${late ? 'late' : 'on time'} (cut-off ${cutoff})`)
+      await writeAudit(AuditLog, 'Bus arrival logged', `${route} at ${time}: ${late ? 'late' : 'on time'} (cut-off ${cutoff})`)
       res.json({ ok: true, arrivalTime: time, late, cutoff })
     })
   )
@@ -2740,7 +2865,7 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         'Route status overridden',
-        `${route} → ${late ? 'Late' : 'On time'} — ${reason}`
+        `${route} → ${late ? 'Late' : 'On time'}: ${reason}`
       )
       res.json({ ok: true, late })
     })
@@ -2811,7 +2936,7 @@ export function buildRecordsRouter({
       ).lean()
 
       if (!record) throw httpError(404, 'That hand-over entry no longer exists.')
-      await writeAudit(AuditLog, 'Hand-over outcome', `${rollNo} — ${chosen.label}`)
+      await writeAudit(AuditLog, 'Hand-over outcome', `${rollNo}: ${chosen.label}`)
       res.json({ date: day, record })
     })
   )
@@ -2890,7 +3015,7 @@ export function buildRecordsRouter({
       ).lean()
 
       if (!record) throw httpError(404, 'No exit restriction found for that student.')
-      await writeAudit(AuditLog, 'Exit restriction resolved', `${rollNo} — ${String(note).trim()}`)
+      await writeAudit(AuditLog, 'Exit restriction resolved', `${rollNo}: ${String(note).trim()}`)
       res.json({ date: day, record })
     })
   )
@@ -2932,7 +3057,7 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         'Exit restriction excused',
-        `${rollNo} — ${String(approver).trim()} until ${endDate}`
+        `${rollNo}: ${String(approver).trim()} until ${endDate}`
       )
       res.json({ date: day, record })
     })
@@ -3027,7 +3152,7 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         'Bus late converted',
-        `${route} — ${convertible.length} exit restriction(s), ${skipped} skipped (entry), reason ${reason}`
+        `${route}: ${convertible.length} exit restriction(s), ${skipped} skipped (entry), reason ${reason}`
       )
       res.json({
         date: day,
@@ -3579,7 +3704,7 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         auditAction,
-        `${student.rollNo} (${student.name}, ${student.grade}/${student.section}) — ${status} at ${time}${
+        `${student.rollNo} (${student.name}, ${student.grade}/${student.section}): ${status} at ${time}${
           remarks ? ` [${remarks}]` : ''
         }`
       )
@@ -3691,7 +3816,7 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         'Daily note recorded',
-        `${student ? `${student.rollNo} (${student.name})` : 'General'} — ${category}: ${String(content).slice(0, 60)}`
+        `${student ? `${student.rollNo} (${student.name})` : 'General'}: ${category}: ${String(content).slice(0, 60)}`
       )
 
       res.status(201).json({ ok: true, note })
@@ -3775,7 +3900,7 @@ export function buildRecordsRouter({
         await writeAudit(
           AuditLog,
           'Note applied as exit restriction',
-          `${student.rollNo} — ${effectiveReason}`
+          `${student.rollNo}: ${effectiveReason}`
         )
       } else if (applyType === 'entry') {
         let picked = Array.isArray(subjects) && subjects.length ? subjects : [note.content]
@@ -3814,7 +3939,7 @@ export function buildRecordsRouter({
         await writeAudit(
           AuditLog,
           'Note applied as entry restriction',
-          `${student.rollNo} — ${picked.join(', ')}`
+          `${student.rollNo}: ${picked.join(', ')}`
         )
       }
 
@@ -3986,7 +4111,7 @@ export function buildRecordsRouter({
 
       await writeAudit(
         AuditLog,
-        `Data entry — ${sheet} restriction sheet`,
+        `Data entry: ${sheet} restriction sheet`,
         `${saved} row(s) saved for ${day} by ${author}`
       )
 
@@ -4019,7 +4144,7 @@ export function buildRecordsRouter({
         saved += 1
       }
 
-      await writeAudit(AuditLog, 'Data entry — CC NC sheet', `${saved} section(s) saved for ${day}`)
+      await writeAudit(AuditLog, 'Data entry: CC NC sheet', `${saved} section(s) saved for ${day}`)
       res.json({ ok: true, saved })
     })
   )
@@ -4197,7 +4322,7 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         'Final approval',
-        `${grade}/${section} approved for ${date}${deductCount ? ` — ${deductCount} NC(s) deducted` : ''}`
+        `${grade}/${section} approved for ${date}${deductCount ? `: ${deductCount} NC(s) deducted` : ''}`
       )
 
       res.json({

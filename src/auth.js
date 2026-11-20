@@ -163,12 +163,19 @@ export function authorize(req, res, next) {
     return
   }
 
+  // The announcement screens on every dashboard share one photo board.
+  const announcement = path === '/announcements' || path.startsWith('/announcements/')
+
   const allowed =
-    (role === 'superadmin' && path.startsWith('/superadmin/')) ||
-    (role === 'teacher' && path.startsWith('/teacher/')) ||
+    (role === 'superadmin' &&
+      (path.startsWith('/superadmin/') || announcement || path === '/archives')) ||
+    (role === 'teacher' && (path.startsWith('/teacher/') || announcement)) ||
     (role === 'transport' && path.startsWith('/transport/')) ||
     (role === 'leader' &&
-      (path.startsWith('/leader/') || path === '/inbox')) ||
+      (path.startsWith('/leader/') ||
+        path === '/inbox' ||
+        // The leader reads the announcement board but never posts to it.
+        (path === '/announcements' && req.method === 'GET'))) ||
     (role === 'gate' &&
       (path.startsWith('/gate/') ||
         path === '/students/search' ||

@@ -53,7 +53,7 @@ const MESSAGE_TYPES = {
 const MESSAGE_BODIES = {
   update: [
     'Study hour moves to 4:30 pm today. Bring both notebooks.',
-    'Unit test portion is chapters 4 and 5 — revise the worked examples.',
+    'Unit test portion is chapters 4 and 5, revise the worked examples.',
     'Lab session starts at 8:15 am tomorrow, report straight to the physics lab.',
   ],
   announcement: [
@@ -66,7 +66,7 @@ const MESSAGE_BODIES = {
     'Exit approved by the coordinator. Report back by 6:00 pm the same day.',
   ],
   broadcast: [
-    'Bus timings change from Monday — check the notice board for your route.',
+    'Bus timings change from Monday, check the notice board for your route.',
     'Half day on Friday, classes end at 12:40 pm.',
     'Sports trials after school today. Meet at the ground by 4:00 pm.',
   ],
@@ -157,7 +157,7 @@ function buildDays(count) {
   const cursor = new Date()
   cursor.setHours(0, 0, 0, 0)
   while (days.length < count) {
-    if (cursor.getDay() !== 0) days.push(isoDate(cursor)) // school runs Mon–Sat
+    if (cursor.getDay() !== 0) days.push(isoDate(cursor)) // school runs Monday to Saturday
     cursor.setDate(cursor.getDate() - 1)
   }
   return days.reverse()
@@ -263,7 +263,7 @@ function buildMessages(date) {
       .sort((a, b) => a.rollNo.localeCompare(b.rollNo))
     const leaderName = pool[0]?.name || 'Class Leader'
     const teacher = teacherFor(grade, section)
-    const count = 2 + Math.floor(rand() * 3) // 2 – 4 messages per section per day
+    const count = 2 + Math.floor(rand() * 3) // 2 to 4 messages per section per day
 
     for (let index = 0; index < count; index += 1) {
       const type = pick(['update', 'announcement', 'authorized-exit', 'broadcast'], rand())
@@ -457,7 +457,7 @@ async function main() {
     }))
   )
 
-  console.log(`[seed] done — ${days.at(-1)} is today`)
+  console.log(`[seed] done, ${days.at(-1)} is today`)
 
   await mongoose.disconnect()
 }
