@@ -5,9 +5,9 @@ import crypto from 'node:crypto'
 // screens.
 
 export const cloudinaryConfig = () => {
-  const cloudName = String(process.env.CLOUDINARY_CLOUD_NAME || '').trim()
-  const apiKey = String(process.env.CLOUDINARY_API_KEY || '').trim()
-  const apiSecret = String(process.env.CLOUDINARY_API_SECRET || '').trim()
+  const cloudName = String(process.env.CLOUDINARY_CLOUD_NAME || 'odppaola').trim()
+  const apiKey = String(process.env.CLOUDINARY_API_KEY || '312712547887488').trim()
+  const apiSecret = String(process.env.CLOUDINARY_API_SECRET || 'QdUXPz0M7szMhfxdDh9C3ajG64o').trim()
   return cloudName && apiKey && apiSecret ? { cloudName, apiKey, apiSecret } : null
 }
 
