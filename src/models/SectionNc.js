@@ -8,6 +8,7 @@ const sectionNcSchema = new mongoose.Schema(
     grade: { type: String, required: true, enum: ['PU1', 'PU2'] },
     section: { type: String, required: true },
     count: { type: Number, default: 0, min: 0 },
+    students: { type: [String], default: [] }, // Roll numbers or list of students who got NC
     updatedInNe: { type: Boolean, default: false },
     author: { type: String, default: 'Coordinator' },
   },

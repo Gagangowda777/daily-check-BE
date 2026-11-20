@@ -4135,7 +4135,7 @@ export function buildRecordsRouter({
           )
           .lean(),
         SectionNc
-          ? SectionNc.find({ date }).select('-_id grade section count updatedInNe').lean()
+          ? SectionNc.find({ date }).select('-_id grade section count students updatedInNe').lean()
           : [],
       ])
 
@@ -4330,12 +4330,38 @@ export function buildRecordsRouter({
         const section = String(row.section || '').trim().toUpperCase()
         if (!grade || !section) continue
 
-        const count = Math.max(0, Math.floor(Number(row.count) || 0))
+        const rawStudents = Array.isArray(row.students)
+          ? row.students
+          : String(row.students || '')
+              .split(/[\s,;]+/)
+              .map((s) => s.trim().toUpperCase())
+              .filter(Boolean)
+
+        const studentList = [...new Set(rawStudents)]
+        const count = Math.max(studentList.length, Math.floor(Number(row.count) || 0))
+
         await SectionNc.findOneAndUpdate(
           { date: day, grade, section },
-          { $set: { count, updatedInNe: Boolean(row.updatedInNe), author } },
+          { $set: { count, students: studentList, updatedInNe: Boolean(row.updatedInNe), author } },
           { upsert: true, setDefaultsOnInsert: true }
         )
+
+        // Also mark these students' DailyRecords with ncFlag so they appear across register and review
+        if (studentList.length > 0) {
+          for (const roll of studentList) {
+            await DailyRecord.updateOne(
+              { date: day, grade, section, rollNo: roll },
+              {
+                $set: {
+                  ncFlag: true,
+                  ncReason: 'Coordinator CC NC',
+                },
+                $max: { ncCount: 1 },
+              }
+            )
+          }
+        }
+
         saved += 1
       }
 
@@ -4352,7 +4378,7 @@ export function buildRecordsRouter({
       await ensureToday()
       const date = req.query.date || todayIso()
 
-      const [records, groups, docs, sections] = await Promise.all([
+      const [records, groups, docs, sections, sectionNcs] = await Promise.all([
         DailyRecord.find({ date })
           .select(
             'grade section rollNo name restrictionType restrictionReason pendingSubjects ' +
@@ -4365,6 +4391,7 @@ export function buildRecordsRouter({
         ]),
         EntrySection.find({ date }).lean(),
         Section.find({}).select('grade section teacher').lean(),
+        SectionNc ? SectionNc.find({ date }).lean() : [],
       ])
 
       const teacherBySection = new Map(
@@ -4373,6 +4400,9 @@ export function buildRecordsRouter({
 
       const bySection = new Map()
       for (const doc of docs) bySection.set(`${doc.grade}:${doc.section}`, doc)
+
+      const ncBySection = new Map()
+      for (const snc of sectionNcs) ncBySection.set(`${snc.grade}:${snc.section}`, snc)
 
       const sectionRows = groups.map((group) => {
         const { grade, section } = group._id
@@ -4442,7 +4472,24 @@ export function buildRecordsRouter({
             })
           }
         }
+        const snc = ncBySection.get(`${grade}:${section}`)
+        if (snc?.students?.length) {
+          for (const roll of snc.students) {
+            if (!ncStudentMap.has(roll)) {
+              const rec = mine.find((r) => r.rollNo === roll)
+              ncStudentMap.set(roll, {
+                rollNo: roll,
+                name: rec?.name || roll,
+                reason: 'CC NC Digital entry',
+                count: 1,
+              })
+            }
+          }
+        }
         const ncStudents = [...ncStudentMap.values()]
+
+        const effectiveNcCount = doc?.ncCount ?? snc?.count ?? null
+        const effectiveUpdatedInNe = Boolean(doc?.updatedInNe || snc?.updatedInNe)
 
         return {
           grade,
@@ -4454,8 +4501,8 @@ export function buildRecordsRouter({
           teacherAcknowledged: acknowledged,
           acknowledgedAt: doc?.adminAcknowledgedAt || null,
           acknowledgedBy: doc?.adminAcknowledgedBy || null,
-          ncCount: doc?.ncCount ?? null,
-          updatedInNe: Boolean(doc?.updatedInNe),
+          ncCount: effectiveNcCount,
+          updatedInNe: effectiveUpdatedInNe,
           ncStudents,
           attendance: {
             present: mine.filter((row) => row.attendance === 'present').length,
