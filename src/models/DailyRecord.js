@@ -42,6 +42,10 @@ const dailyRecordSchema = new mongoose.Schema(
     // Who acknowledged the restriction, and when.
     acknowledgedBy: { type: String, default: null },
     acknowledgedAt: { type: String, default: null },
+    // The class teacher ticking this uploaded row off student by student on the
+    // Admin data screen, separately from the whole-upload acknowledgement.
+    uploadAcknowledgedBy: { type: String, default: null },
+    uploadAcknowledgedAt: { type: String, default: null },
     resolutionStatus: {
       type: String,
       required: true,

@@ -166,18 +166,22 @@ export function authorize(req, res, next) {
   // The announcement screens on every dashboard share one photo board.
   const announcement = path === '/announcements' || path.startsWith('/announcements/')
 
+  // Broadcast archives are read by every dashboard, inside its inbox.
+  const archives = path === '/archives'
+
   const allowed =
     (role === 'superadmin' &&
-      (path.startsWith('/superadmin/') || announcement || path === '/archives')) ||
-    (role === 'teacher' && (path.startsWith('/teacher/') || announcement)) ||
-    (role === 'transport' && path.startsWith('/transport/')) ||
+      (path.startsWith('/superadmin/') || announcement || archives)) ||
+    (role === 'teacher' && (path.startsWith('/teacher/') || announcement || archives)) ||
+    (role === 'transport' &&
+      (path.startsWith('/transport/') || announcement || archives)) ||
+    // The class leader posts the announcement photos every dashboard reads.
     (role === 'leader' &&
-      (path.startsWith('/leader/') ||
-        path === '/inbox' ||
-        // The leader reads the announcement board but never posts to it.
-        (path === '/announcements' && req.method === 'GET'))) ||
+      (path.startsWith('/leader/') || path === '/inbox' || announcement || archives)) ||
     (role === 'gate' &&
       (path.startsWith('/gate/') ||
+        announcement ||
+        archives ||
         path === '/students/search' ||
         /^\/students\/[A-Za-z0-9_-]+$/.test(path)))
 

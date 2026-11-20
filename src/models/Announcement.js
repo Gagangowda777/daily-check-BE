@@ -10,11 +10,14 @@ const announcementSchema = new mongoose.Schema(
     authorRole: {
       type: String,
       required: true,
-      enum: ['admin', 'superadmin', 'teacher'],
+      enum: ['admin', 'superadmin', 'teacher', 'leader'],
     },
     authorName: { type: String, required: true },
     authorEmail: { type: String, default: null },
-    context: { type: String, default: null }, // e.g. "11A · Class Teacher"
+    context: { type: String, default: null }, // e.g. "11A · Class Leader"
+    // Who has opened the photo, as "role:email" so one dashboard opening it
+    // never marks it seen for another.
+    viewedBy: { type: [String], default: [] },
   },
   { timestamps: true }
 )

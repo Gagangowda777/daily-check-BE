@@ -83,6 +83,15 @@ const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 const isoDaysAgo = (days) =>
   new Date(Date.now() - days * 24 * 60 * 60 * 1000).toLocaleDateString('en-CA')
 
+// The school day before an ISO date, used to spot a student who is on the same
+// restriction sheet two days running.
+const previousIso = (iso) => {
+  const when = new Date(`${iso}T00:00:00Z`)
+  if (Number.isNaN(when.getTime())) return ''
+  when.setUTCDate(when.getUTCDate() - 1)
+  return when.toISOString().slice(0, 10)
+}
+
 const toMinutes = (clock) => {
   if (!clock) return null
   const [hours, minutes] = clock.split(':').map(Number)
@@ -180,13 +189,18 @@ export function buildRecordsRouter({
 
   // ---- announcement photos ------------------------------------------------
 
-  const announcementOut = (doc) => ({
+  // One viewer per dashboard account, so "seen" is per person rather than
+  // shared between everyone signed in as the same role.
+  const viewerKey = (user) => (user ? `${user.role}:${user.email || user.name || ''}` : '')
+
+  const announcementOut = (doc, viewer = '') => ({
     id: String(doc._id),
     caption: doc.caption || '',
     photoUrl: doc.photoUrl,
     author: doc.authorName,
     authorRole: doc.authorRole,
     context: doc.context || null,
+    seen: viewer ? (doc.viewedBy || []).includes(viewer) : false,
     date: doc.createdAt
       ? new Date(doc.createdAt).toLocaleDateString('en-CA', { timeZone: IST })
       : '',
@@ -220,7 +234,26 @@ export function buildRecordsRouter({
         .sort({ createdAt: -1 })
         .limit(60)
         .lean()
-      res.json({ announcements: docs.map(announcementOut) })
+      const viewer = viewerKey(req.user)
+      res.json({ announcements: docs.map((doc) => announcementOut(doc, viewer)) })
+    })
+  )
+
+  // An announcement is read only when that particular row is opened, the same
+  // way an inbox message is.
+  router.post(
+    '/announcements/:id/view',
+    api(async (req, res) => {
+      const viewer = viewerKey(req.user)
+      if (!/^[0-9a-f]{24}$/i.test(req.params.id)) throw httpError(400, 'Unknown announcement.')
+
+      const doc = await Announcement.findByIdAndUpdate(
+        req.params.id,
+        { $addToSet: { viewedBy: viewer } },
+        { new: true }
+      ).lean()
+      if (!doc) throw httpError(404, 'That announcement is no longer available.')
+      res.json({ ok: true, seen: true })
     })
   )
 
@@ -229,6 +262,11 @@ export function buildRecordsRouter({
   router.post(
     '/announcements',
     api(async (req, res) => {
+      const role = req.user?.role
+      if (role !== 'leader') {
+        throw httpError(403, 'Only the class leader posts announcement photos.')
+      }
+
       const { image, caption = '' } = req.body || {}
       const text = String(caption).trim()
       if (text.length > 1000) throw httpError(400, 'Keep the announcement under 1000 characters.')
@@ -250,18 +288,17 @@ export function buildRecordsRouter({
         mime,
       })
 
-      const role = req.user?.role
       const doc = await Announcement.create({
         caption: text,
         photoUrl: upload.url,
         photoPublicId: upload.publicId,
         authorRole: role,
-        authorName: INBOX_ROLE_LABEL[role] || role,
+        authorName: req.user?.name || INBOX_ROLE_LABEL[role] || role,
         authorEmail: req.user?.email || null,
-        context:
-          role === 'teacher'
-            ? `${classLabelOf(req.user.grade, req.user.section)} · Class Teacher`
-            : null,
+        context: req.user?.grade
+          ? `${classLabelOf(req.user.grade, req.user.section)} · ${INBOX_ROLE_LABEL[role]}`
+          : null,
+        viewedBy: [viewerKey(req.user)].filter(Boolean),
       })
 
       await writeAudit(
@@ -269,7 +306,7 @@ export function buildRecordsRouter({
         'Announcement photo posted',
         `${INBOX_ROLE_LABEL[role] || role}: ${upload.url}`
       )
-      res.status(201).json({ announcement: announcementOut(doc.toObject()) })
+      res.status(201).json({ announcement: announcementOut(doc.toObject(), viewerKey(req.user)) })
     })
   )
 
@@ -884,6 +921,11 @@ export function buildRecordsRouter({
       if (studentOps.length > 0) {
         await Student.bulkWrite(studentOps, { ordered: false })
         await DailyRecord.bulkWrite(dailyOps, { ordered: false })
+        // A route in this upload must appear on the transport log the same day.
+        await syncRouteLogs(
+          day,
+          rows.map((row) => (row.busRoute ? String(row.busRoute).trim().toUpperCase() : null))
+        )
         await writeAudit(AuditLog, 'Bulk roster import', `${successCount} students imported/updated from Excel/sheet`)
       }
 
@@ -918,6 +960,7 @@ export function buildRecordsRouter({
           },
         }
       )
+      await syncRouteLogs(todayIso(), [student.busRoute])
 
       await writeAudit(AuditLog, 'Student updated', `${rollNo}: ${student.name}`)
       res.json({ ok: true, student })
@@ -2125,6 +2168,8 @@ export function buildRecordsRouter({
         approver: record.excusedApprover,
         acknowledgedBy: record.acknowledgedBy,
         acknowledgedAt: record.acknowledgedAt,
+        uploadAcknowledgedBy: record.uploadAcknowledgedBy || null,
+        uploadAcknowledgedAt: record.uploadAcknowledgedAt || null,
       }))
 
       const entry = records
@@ -2138,6 +2183,8 @@ export function buildRecordsRouter({
           handover: Boolean(record.handover),
           handoverAt: record.handoverAt,
           note: record.resolutionNote,
+          uploadAcknowledgedBy: record.uploadAcknowledgedBy || null,
+          uploadAcknowledgedAt: record.uploadAcknowledgedAt || null,
         }))
 
       const attendance = records
@@ -2166,6 +2213,8 @@ export function buildRecordsRouter({
           name: row.name,
           detail: row.reason || 'Exit restriction',
           status: row.status,
+          acknowledgedAt: row.uploadAcknowledgedAt,
+          acknowledgedBy: row.uploadAcknowledgedBy,
         })),
         ...entry.map((row) => ({
           type: 'entry',
@@ -2173,6 +2222,8 @@ export function buildRecordsRouter({
           name: row.name,
           detail: (row.subjects || []).join(', ') || 'All subjects',
           status: row.handover ? 'handed over' : 'pending',
+          acknowledgedAt: row.uploadAcknowledgedAt,
+          acknowledgedBy: row.uploadAcknowledgedBy,
         })),
       ].sort((a, b) => a.rollNo.localeCompare(b.rollNo))
 
@@ -2677,6 +2728,46 @@ export function buildRecordsRouter({
     })
   )
 
+  // One uploaded row ticked off by the class teacher, student by student.
+  router.post(
+    '/teacher/admin-data/row/acknowledge',
+    api(async (req, res) => {
+      const { grade, section } = needSection(req.body || {})
+      const date = req.body?.date || todayIso()
+      const rollNo = String(req.body?.rollNo || '')
+        .trim()
+        .toUpperCase()
+      const type = req.body?.type === 'entry' ? 'entry' : 'exit'
+      if (!rollNo) throw httpError(400, 'Choose the student to acknowledge.')
+
+      const record = await DailyRecord.findOne({
+        date,
+        grade,
+        section,
+        rollNo,
+        restrictionType: type,
+      })
+      if (!record) throw httpError(404, 'That uploaded row is no longer on today’s list.')
+
+      const teacher = await teacherOf(grade, section)
+      record.uploadAcknowledgedAt = nowClock()
+      record.uploadAcknowledgedBy = teacher
+      await record.save()
+
+      await writeAudit(
+        AuditLog,
+        'Admin row acknowledged',
+        `${grade}/${section}: ${rollNo} (${type}) by ${teacher}`
+      )
+      res.json({
+        ok: true,
+        rollNo,
+        acknowledgedAt: record.uploadAcknowledgedAt,
+        acknowledgedBy: teacher,
+      })
+    })
+  )
+
   router.post(
     '/teacher/message',
     api(async (req, res) => {
@@ -2798,6 +2889,54 @@ export function buildRecordsRouter({
       res.json(await transportDay(req.query.date || todayIso()))
     })
   )
+
+  // A bus route changed on the admin desk has to reach the transport log and
+  // the day's rows straight away, or the new route has no arrival row and the
+  // teacher, leader and gate screens never show those students as late.
+  const syncRouteLogs = async (day, routes) => {
+    const wanted = [...new Set((routes || []).filter(Boolean).map((route) => String(route).toUpperCase()))]
+    if (wanted.length === 0) return
+
+    const existing = await BusLog.find({ date: day, route: { $in: wanted } }).lean()
+    const logged = new Set(existing.map((log) => log.route))
+    const missing = wanted.filter((route) => !logged.has(route))
+    if (missing.length) {
+      await BusLog.bulkWrite(
+        missing.map((route) => ({
+          updateOne: {
+            filter: { date: day, route },
+            update: {
+              $setOnInsert: {
+                date: day,
+                route,
+                arrivalTime: null,
+                late: false,
+                affectedStudents: 0,
+              },
+            },
+            upsert: true,
+          },
+        })),
+        { ordered: false }
+      )
+    }
+
+    const settings = await loadSettings(Settings)
+    const cutoff = toMinutes(settings.busCutoff) || toMinutes('08:20')
+    const logs = await BusLog.find({ date: day, route: { $in: wanted } }).lean()
+    await Promise.all(
+      logs.map((log) => {
+        const late =
+          typeof log.overrideLate === 'boolean'
+            ? log.overrideLate
+            : Boolean(log.arrivalTime && toMinutes(log.arrivalTime) > cutoff)
+        return DailyRecord.updateMany(
+          { date: day, busRoute: log.route, rider: { $ne: false } },
+          { $set: { busLate: late } }
+        )
+      })
+    )
+  }
 
   const logArrival = async (route, date, time) => {
     const settings = await loadSettings(Settings)
@@ -4079,6 +4218,9 @@ export function buildRecordsRouter({
                 pendingSubjects: [],
                 resolutionStatus: status,
                 resolvedOn: resolved ? day : null,
+                // A fresh upload has to be acknowledged again.
+                uploadAcknowledgedAt: null,
+                uploadAcknowledgedBy: null,
               },
               $setOnInsert: insertDefaults(day, student),
             },
@@ -4100,6 +4242,8 @@ export function buildRecordsRouter({
                 restrictionEndDate: null,
                 resolutionStatus: 'pending',
                 resolvedOn: null,
+                uploadAcknowledgedAt: null,
+                uploadAcknowledgedBy: null,
               },
               $setOnInsert: insertDefaults(day, student),
             },
@@ -4109,13 +4253,46 @@ export function buildRecordsRouter({
         saved += 1
       }
 
+      // A student who is already on yesterday's sheet is worth flagging: the
+      // coordinator may be repeating a row that was never cleared.
+      const savedRolls = [
+        ...new Set(
+          rows
+            .map((row) => String(row.rollNo || '').trim().toUpperCase())
+            .filter((rollNo) => rollNo && studentMap.has(rollNo))
+        ),
+      ]
+      let repeats = []
+      if (savedRolls.length) {
+        const yesterday = previousIso(day)
+        const previous = yesterday
+          ? await DailyRecord.find({
+              date: yesterday,
+              rollNo: { $in: savedRolls },
+              restrictionType: sheet,
+            })
+              .select('rollNo name grade section restrictionReason pendingSubjects')
+              .lean()
+          : []
+        repeats = previous.map((row) => ({
+          rollNo: row.rollNo,
+          name: row.name,
+          classLabel: classLabelOf(row.grade, row.section),
+          reason:
+            sheet === 'exit'
+              ? row.restrictionReason || ''
+              : (row.pendingSubjects || []).join(', '),
+          date: yesterday,
+        }))
+      }
+
       await writeAudit(
         AuditLog,
         `Data entry: ${sheet} restriction sheet`,
         `${saved} row(s) saved for ${day} by ${author}`
       )
 
-      res.json({ ok: true, saved, errors })
+      res.json({ ok: true, saved, errors, repeats })
     })
   )
 
