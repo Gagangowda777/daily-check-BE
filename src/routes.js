@@ -2108,13 +2108,14 @@ export function buildRecordsRouter({
       // broadcasts also land in LeaderMessage, so they must not be mistaken for
       // the teacher's message or satisfy the close check.
       const teacher = await teacherOf(grade, section)
-      const [records, entryDoc, latestMessage, busRoutes] = await Promise.all([
+      const [records, entryDoc, latestMessage, busRoutes, sectionNc] = await Promise.all([
         DailyRecord.find({ date, grade, section }).lean(),
         EntrySection.findOne({ date, grade, section }).lean(),
         LeaderMessage.findOne({ date, grade, section, sender: teacher })
           .sort({ sentAt: -1 })
           .lean(),
         BusLog.find({ date }).lean(),
+        SectionNc ? SectionNc.findOne({ date, grade, section }).lean() : null,
       ])
 
       const busByRoute = new Map(busRoutes.map((route) => [route.route, route]))
@@ -2214,28 +2215,54 @@ export function buildRecordsRouter({
         nc: attendance.filter((row) => row.ncFlag).length,
       }
 
-      // Everything the coordinator uploaded for this section today, from both
-      // the exit and entry restriction sheets.
-      const adminRows = [
-        ...exit.map((row) => ({
-          type: 'exit',
-          rollNo: row.rollNo,
-          name: row.name,
-          detail: row.reason || 'Exit restriction',
-          status: row.status,
-          acknowledgedAt: row.uploadAcknowledgedAt,
-          acknowledgedBy: row.uploadAcknowledgedBy,
-        })),
-        ...entry.map((row) => ({
-          type: 'entry',
-          rollNo: row.rollNo,
-          name: row.name,
-          detail: (row.subjects || []).join(', ') || 'All subjects',
-          status: row.handover ? 'handed over' : 'pending',
-          acknowledgedAt: row.uploadAcknowledgedAt,
-          acknowledgedBy: row.uploadAcknowledgedBy,
-        })),
-      ].sort((a, b) => a.rollNo.localeCompare(b.rollNo))
+      const adminRows = records
+        .filter((record) => record.restrictionType === 'exit' || record.restrictionType === 'entry')
+        .map((record) => ({
+          type: record.restrictionType,
+          rollNo: record.rollNo,
+          name: record.name,
+          detail:
+            record.restrictionType === 'exit'
+              ? record.restrictionReason || 'Exit restriction'
+              : record.pendingSubjects?.length
+                ? record.pendingSubjects.join(', ')
+                : record.restrictionReason || 'All subjects',
+          status:
+            record.restrictionType === 'entry' && record.handover
+              ? 'handed over'
+              : record.resolutionStatus,
+          acknowledgedAt: record.uploadAcknowledgedAt || null,
+          acknowledgedBy: record.uploadAcknowledgedBy || null,
+        }))
+        .sort((a, b) => a.rollNo.localeCompare(b.rollNo))
+
+      const selectedNcRollNos = [
+        ...new Set(
+          (sectionNc?.students || [])
+            .map((rollNo) => String(rollNo || '').trim().toUpperCase())
+            .filter(Boolean)
+        ),
+      ]
+      const selectedNcRoster = selectedNcRollNos.length
+        ? await Student.find({ rollNo: { $in: selectedNcRollNos } }).select('rollNo name').lean()
+        : []
+      const recordsByRoll = new Map(records.map((record) => [record.rollNo, record]))
+      const rosterByRoll = new Map(selectedNcRoster.map((student) => [student.rollNo, student]))
+      const ncStudentMap = new Map(
+        attendance.filter((row) => row.ncFlag).map((row) => [row.rollNo, row])
+      )
+      for (const rollNo of selectedNcRollNos) {
+        const record = recordsByRoll.get(rollNo)
+        const student = rosterByRoll.get(rollNo)
+        const current = ncStudentMap.get(rollNo)
+        ncStudentMap.set(rollNo, {
+          rollNo,
+          name: current?.name || record?.name || student?.name || rollNo,
+          ncCount: Math.max(Number(current?.ncCount) || Number(record?.ncCount) || 0, 1),
+          ncReason: current?.ncReason || record?.ncReason || 'Coordinator CC NC',
+        })
+      }
+      const ncStudents = [...ncStudentMap.values()].sort((a, b) => a.rollNo.localeCompare(b.rollNo))
 
       const clock = clockNow()
 
@@ -2249,7 +2276,11 @@ export function buildRecordsRouter({
         lateBuses,
         exit,
         entry,
-        nc: { count: entryDoc?.ncCount ?? null, updatedInNe: Boolean(entryDoc?.updatedInNe) },
+        nc: {
+          count: entryDoc?.ncCount ?? null,
+          updatedInNe: Boolean(entryDoc?.updatedInNe),
+          students: ncStudents,
+        },
         attendance: { rows: attendance, summary: attendanceSummary },
         adminData: {
           rows: adminRows,
@@ -2562,36 +2593,11 @@ export function buildRecordsRouter({
       const date = req.body?.date || todayIso()
       const teacher = await teacherOf(grade, section)
 
-      // Closing the day is the teacher's 4/4 checkpoint, so every block must
-      // actually be finished: not just the entry checks.
-      const [pendingEntry, openExit, entryDoc, message] = await Promise.all([
-        DailyRecord.countDocuments({
-          date,
-          grade,
-          section,
-          restrictionType: 'entry',
-          resolutionStatus: 'pending',
-        }),
-        DailyRecord.countDocuments({
-          date,
-          grade,
-          section,
-          restrictionType: 'exit',
-          resolutionStatus: { $in: ['pending', 'acknowledged'] },
-        }),
+      const [entryDoc, message] = await Promise.all([
         EntrySection.findOne({ date, grade, section }).lean(),
         LeaderMessage.findOne({ date, grade, section, sender: teacher }).lean(),
       ])
 
-      if (pendingEntry > 0) {
-        throw httpError(400, `${pendingEntry} student(s) still to verify: close the entry check first.`)
-      }
-      if (openExit > 0) {
-        throw httpError(
-          400,
-          `${openExit} exit restriction(s) still open: acknowledge and resolve them first.`
-        )
-      }
       if (entryDoc?.ncCount === null || entryDoc?.ncCount === undefined) {
         throw httpError(400, 'Enter the daily NC count before closing.')
       }
@@ -2667,17 +2673,13 @@ export function buildRecordsRouter({
     })
   )
 
-  // Exactly the rows the teacher page lists: every exit restriction plus the
-  // entry checks that are still pending.
+  // Keep the teacher's upload count stable after an entry check is processed.
   const adminUploadRows = async (grade, section, date) =>
     DailyRecord.countDocuments({
       date,
       grade,
       section,
-      $or: [
-        { restrictionType: 'exit' },
-        { restrictionType: 'entry', resolutionStatus: 'pending' },
-      ],
+      restrictionType: { $in: ['exit', 'entry'] },
     })
 
   router.post(
@@ -4160,6 +4162,22 @@ export function buildRecordsRouter({
     })
   )
 
+  router.get(
+    '/datasheet/:date/nc/:grade/:section/students',
+    api(async (req, res) => {
+      const grade = ['PU1', 'PU2'].includes(req.params.grade) ? req.params.grade : null
+      const section = String(req.params.section || '').trim().toUpperCase()
+      if (!grade || !section) throw httpError(400, 'Choose a valid grade and section.')
+
+      const students = await Student.find({ grade, section })
+        .sort({ rollNo: 1 })
+        .select('rollNo name grade section')
+        .lean()
+
+      res.json({ students })
+    })
+  )
+
   router.post(
     '/datasheet/entry',
     api(async (req, res) => {
@@ -4340,6 +4358,27 @@ export function buildRecordsRouter({
         const studentList = [...new Set(rawStudents)]
         const count = Math.max(studentList.length, Math.floor(Number(row.count) || 0))
 
+        const previousSection = await SectionNc.findOne({ date: day, grade, section })
+          .select('students')
+          .lean()
+        const selectedStudents = new Set(studentList)
+        const removedStudents = (previousSection?.students || []).filter(
+          (rollNo) => !selectedStudents.has(rollNo)
+        )
+        if (removedStudents.length) {
+          await DailyRecord.updateMany(
+            {
+              date: day,
+              grade,
+              section,
+              rollNo: { $in: removedStudents },
+              ncReason: 'Coordinator CC NC',
+              ncCount: { $lte: 1 },
+            },
+            { $set: { ncFlag: false, ncCount: 0, ncReason: null, ncAt: null } }
+          )
+        }
+
         await SectionNc.findOneAndUpdate(
           { date: day, grade, section },
           { $set: { count, students: studentList, updatedInNe: Boolean(row.updatedInNe), author } },
@@ -4411,9 +4450,7 @@ export function buildRecordsRouter({
         const doc = bySection.get(`${grade}:${section}`)
 
         const exit = mine.filter((row) => row.restrictionType === 'exit')
-        const entry = mine.filter(
-          (row) => row.restrictionType === 'entry' && row.resolutionStatus === 'pending'
-        )
+        const entry = mine.filter((row) => row.restrictionType === 'entry')
         const adminRows = [
           ...exit.map((row) => {
             const parsedCount = parseNcCountFromDetail(row.restrictionReason)
@@ -4438,8 +4475,8 @@ export function buildRecordsRouter({
               type: 'entry',
               rollNo: row.rollNo,
               name: row.name,
-              detail: (row.pendingSubjects || []).join(', ') || 'All subjects',
-              status: row.handover ? 'handed over' : 'pending',
+              detail: (row.pendingSubjects || []).join(', ') || row.restrictionReason || 'All subjects',
+              status: row.handover ? 'handed over' : row.resolutionStatus,
               ncFlag: isNc,
               ncCount: count,
               ncReason: row.ncReason || (parsedCount > 0 ? row.restrictionReason : null),
@@ -4561,10 +4598,7 @@ export function buildRecordsRouter({
         date,
         grade,
         section,
-        $or: [
-          { restrictionType: 'exit' },
-          { restrictionType: 'entry', resolutionStatus: 'pending' },
-        ],
+        restrictionType: { $in: ['exit', 'entry'] },
       })
       if (uploaded === 0) throw httpError(400, 'Nothing was uploaded for this section today.')
       if ((doc.adminAcknowledgedCount || 0) !== uploaded) {
