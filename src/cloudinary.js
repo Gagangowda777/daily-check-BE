@@ -5,9 +5,9 @@ import crypto from 'node:crypto'
 // screens.
 
 export const cloudinaryConfig = () => {
-  const cloudName = process.env.CLOUDINARY_CLOUD_NAME
-  const apiKey = process.env.CLOUDINARY_API_KEY
-  const apiSecret = process.env.CLOUDINARY_API_SECRET
+  const cloudName = String(process.env.CLOUDINARY_CLOUD_NAME || '').trim()
+  const apiKey = String(process.env.CLOUDINARY_API_KEY || '').trim()
+  const apiSecret = String(process.env.CLOUDINARY_API_SECRET || '').trim()
   return cloudName && apiKey && apiSecret ? { cloudName, apiKey, apiSecret } : null
 }
 
@@ -22,7 +22,12 @@ export async function uploadImage(
   { folder, publicId, mime = 'image/jpeg', overwrite = false } = {}
 ) {
   const config = cloudinaryConfig()
-  if (!config) throw new Error('Cloudinary credentials are not configured.')
+  if (!config) {
+    const missing = ['CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET']
+      .filter((key) => !String(process.env[key] || '').trim())
+      .join(', ')
+    throw new Error(`Cloudinary credentials are not configured (missing: ${missing}).`)
+  }
 
   const id = publicId || crypto.randomUUID()
   const timestamp = Math.round(Date.now() / 1000)

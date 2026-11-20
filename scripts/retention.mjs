@@ -1,4 +1,4 @@
-import 'dotenv/config'
+import '../src/env.js'
 import mongoose from 'mongoose'
 import { connectDb, isConnected } from '../src/db.js'
 import { runRetention, retentionDays } from '../src/retention.js'

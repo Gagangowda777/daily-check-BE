@@ -1,4 +1,4 @@
-import 'dotenv/config'
+import './src/env.js'
 import mongoose from 'mongoose'
 
 const uri = process.env.MONGODB_URI

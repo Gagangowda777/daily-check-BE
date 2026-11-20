@@ -1,4 +1,4 @@
-import 'dotenv/config'
+import './src/env.js'
 import express from 'express'
 import cors from 'cors'
 import mongoose from 'mongoose'
@@ -19,6 +19,7 @@ import SectionNc from './src/models/SectionNc.js'
 import InboxMessage from './src/models/InboxMessage.js'
 import Announcement from './src/models/Announcement.js'
 import { buildRecordsRouter } from './src/routes.js'
+import { cloudinaryConfig } from './src/cloudinary.js'
 import {
   buildAuthRouter,
   authorize,
@@ -74,7 +75,11 @@ const PORT =
   Number.isFinite(injected) && injected > 0 ? injected : Number(process.env.API_PORT) || 4000
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, db: isConnected() ? 'connected' : 'disconnected' })
+  res.json({
+    ok: true,
+    db: isConnected() ? 'connected' : 'disconnected',
+    cloudinary: cloudinaryConfig() ? 'configured' : 'missing',
+  })
 })
 
 // Every data route needs the database, so fail clearly instead of hanging.
@@ -141,7 +146,14 @@ async function start() {
     }
   }
 
-  app.listen(PORT, () => console.log(`[api] listening on http://localhost:${PORT}`))
+  app.listen(PORT, () =>
+    console.log(
+      `[api] listening on http://localhost:${PORT}` +
+        (cloudinaryConfig()
+          ? ' - Cloudinary configured'
+          : ' - Cloudinary NOT configured: announcement photos and archives will fail')
+    )
+  )
 
   // Excel-fed rows are archived and deleted once they are older than
   // RETENTION_DAYS; the first pass runs shortly after boot.

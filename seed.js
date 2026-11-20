@@ -1,6 +1,6 @@
 import fs from 'node:fs'
+import './src/env.js'
 import mongoose from 'mongoose'
-import 'dotenv/config'
 import { connectDb } from './src/db.js'
 import Student from './src/models/Student.js'
 import DailyRecord from './src/models/DailyRecord.js'
