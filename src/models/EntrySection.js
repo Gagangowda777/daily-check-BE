@@ -31,6 +31,9 @@ const entrySectionSchema = new mongoose.Schema(
     // NCs the super admin chose to deduct when approving this day.
     ncDeducted: { type: Number, default: 0 },
     ncDeductedAt: { type: String, default: null },
+    // The students whose NC was reduced on final approval, kept for the day's
+    // audit trail after their rows stop carrying the flag.
+    ncReducedRollNos: { type: [String], default: [] },
   },
   { timestamps: true }
 )
