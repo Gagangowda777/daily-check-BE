@@ -23,6 +23,15 @@ const DEFAULT_SETTINGS = {
   routeCutoffs: {},
 }
 
+const parseNcCountFromDetail = (detail) => {
+  const match = String(detail || '').match(/(?:crossed\s*(\d+)|(\d+))\s*nc/i)
+  if (match) {
+    const num = Number(match[1] || match[2])
+    return Number.isFinite(num) && num > 0 ? num : 3
+  }
+  return /nc/i.test(String(detail || '')) ? 3 : 0
+}
+
 const HANDOVER_OUTCOMES = {
   cleared: { label: 'Cleared & Sent to Class', status: 'resolved' },
   'sent-home': { label: 'Sent Home', status: 'excused' },
@@ -4376,38 +4385,64 @@ export function buildRecordsRouter({
           (row) => row.restrictionType === 'entry' && row.resolutionStatus === 'pending'
         )
         const adminRows = [
-          ...exit.map((row) => ({
-            type: 'exit',
-            rollNo: row.rollNo,
-            name: row.name,
-            detail: row.restrictionReason || 'Exit restriction',
-            status: row.resolutionStatus,
-            ncFlag: Boolean(row.ncFlag),
-            ncCount: Number(row.ncCount) || (row.ncFlag ? 1 : 0),
-            ncReason: row.ncReason || null,
-          })),
-          ...entry.map((row) => ({
-            type: 'entry',
-            rollNo: row.rollNo,
-            name: row.name,
-            detail: (row.pendingSubjects || []).join(', ') || 'All subjects',
-            status: row.handover ? 'handed over' : 'pending',
-            ncFlag: Boolean(row.ncFlag),
-            ncCount: Number(row.ncCount) || (row.ncFlag ? 1 : 0),
-            ncReason: row.ncReason || null,
-          })),
+          ...exit.map((row) => {
+            const parsedCount = parseNcCountFromDetail(row.restrictionReason)
+            const isNc = Boolean(row.ncFlag) || parsedCount > 0
+            const count = Number(row.ncCount) || (row.ncFlag ? 1 : parsedCount || 0)
+            return {
+              type: 'exit',
+              rollNo: row.rollNo,
+              name: row.name,
+              detail: row.restrictionReason || 'Exit restriction',
+              status: row.resolutionStatus,
+              ncFlag: isNc,
+              ncCount: count,
+              ncReason: row.ncReason || (parsedCount > 0 ? row.restrictionReason : null),
+            }
+          }),
+          ...entry.map((row) => {
+            const parsedCount = parseNcCountFromDetail(row.restrictionReason)
+            const isNc = Boolean(row.ncFlag) || parsedCount > 0
+            const count = Number(row.ncCount) || (row.ncFlag ? 1 : parsedCount || 0)
+            return {
+              type: 'entry',
+              rollNo: row.rollNo,
+              name: row.name,
+              detail: (row.pendingSubjects || []).join(', ') || 'All subjects',
+              status: row.handover ? 'handed over' : 'pending',
+              ncFlag: isNc,
+              ncCount: count,
+              ncReason: row.ncReason || (parsedCount > 0 ? row.restrictionReason : null),
+            }
+          }),
         ].sort((a, b) => a.rollNo.localeCompare(b.rollNo))
 
         const uploaded = adminRows.length
         const acknowledged = Boolean(doc?.adminAcknowledgedAt) && (doc?.adminAcknowledgedCount || 0) === uploaded
-        const ncStudents = mine
-          .filter((row) => row.ncFlag)
-          .map((row) => ({
-            rollNo: row.rollNo,
-            name: row.name,
-            reason: row.ncReason || 'Delayed arrival',
-            count: Number(row.ncCount) || 1,
-          }))
+
+        // Collect ncStudents from attendance ncFlag as well as coordinator rows mentioning NCs
+        const ncStudentMap = new Map()
+        for (const row of mine) {
+          if (row.ncFlag) {
+            ncStudentMap.set(row.rollNo, {
+              rollNo: row.rollNo,
+              name: row.name,
+              reason: row.ncReason || 'Delayed arrival',
+              count: Number(row.ncCount) || 1,
+            })
+          }
+        }
+        for (const item of adminRows) {
+          if (item.ncFlag && item.ncCount > 0 && !ncStudentMap.has(item.rollNo)) {
+            ncStudentMap.set(item.rollNo, {
+              rollNo: item.rollNo,
+              name: item.name,
+              reason: item.ncReason || item.detail || 'Crossed 3 NCs',
+              count: item.ncCount,
+            })
+          }
+        }
+        const ncStudents = [...ncStudentMap.values()]
 
         return {
           grade,
@@ -4514,19 +4549,26 @@ export function buildRecordsRouter({
           grade,
           section,
           rollNo: { $in: reducedRollNos },
-          ncFlag: true,
         })
-          .select('rollNo ncCount')
+          .select('rollNo ncFlag ncCount restrictionReason')
           .lean()
         const flaggedByRoll = new Map(
-          flagged.map((row) => [row.rollNo, Number(row.ncCount) || 1])
+          flagged.map((row) => {
+            const parsed = parseNcCountFromDetail(row.restrictionReason)
+            const count = Number(row.ncCount) || (row.ncFlag ? 1 : parsed || 0)
+            return [row.rollNo, { record: row, count }]
+          })
         )
-        const missing = reducedRollNos.filter((rollNo) => !flaggedByRoll.has(rollNo))
+        const missing = reducedRollNos.filter((rollNo) => {
+          const entry = flaggedByRoll.get(rollNo)
+          return !entry || entry.count < 1
+        })
         if (missing.length) {
           throw httpError(400, `These students have no NC today: ${missing.join(', ')}.`)
         }
         for (const { rollNo, count } of reductions) {
-          const available = flaggedByRoll.get(rollNo)
+          const entry = flaggedByRoll.get(rollNo)
+          const available = entry?.count || 0
           if (count > available) {
             throw httpError(
               400,
@@ -4543,13 +4585,21 @@ export function buildRecordsRouter({
         }
 
         for (const { rollNo, count } of reductions) {
-          const remaining = (flaggedByRoll.get(rollNo) || 1) - count
-          await DailyRecord.updateOne(
-            { date, grade, section, rollNo },
-            remaining > 0
-              ? { $set: { ncCount: remaining } }
-              : { $set: { ncFlag: false, ncCount: 0, ncReason: null, ncAt: null } }
-          )
+          const entry = flaggedByRoll.get(rollNo)
+          const available = entry?.count || 1
+          const remaining = available - count
+          const update = remaining > 0
+            ? { $set: { ncCount: remaining, ncFlag: true } }
+            : { $set: { ncFlag: false, ncCount: 0, ncReason: null, ncAt: null } }
+          
+          // If the restriction reason itself was "Crossed 3 NCs", also clear or resolve the restriction if fully reduced
+          if (remaining === 0 && entry?.record?.restrictionType === 'exit' && /nc/i.test(entry?.record?.restrictionReason || '')) {
+            update.$set.resolutionStatus = 'resolved'
+            update.$set.resolvedOn = date
+            update.$set.resolutionNote = 'NCs reduced and cleared by Super Admin'
+          }
+
+          await DailyRecord.updateOne({ date, grade, section, rollNo }, update)
         }
       }
 
