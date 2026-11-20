@@ -4382,6 +4382,9 @@ export function buildRecordsRouter({
             name: row.name,
             detail: row.restrictionReason || 'Exit restriction',
             status: row.resolutionStatus,
+            ncFlag: Boolean(row.ncFlag),
+            ncCount: Number(row.ncCount) || (row.ncFlag ? 1 : 0),
+            ncReason: row.ncReason || null,
           })),
           ...entry.map((row) => ({
             type: 'entry',
@@ -4389,6 +4392,9 @@ export function buildRecordsRouter({
             name: row.name,
             detail: (row.pendingSubjects || []).join(', ') || 'All subjects',
             status: row.handover ? 'handed over' : 'pending',
+            ncFlag: Boolean(row.ncFlag),
+            ncCount: Number(row.ncCount) || (row.ncFlag ? 1 : 0),
+            ncReason: row.ncReason || null,
           })),
         ].sort((a, b) => a.rollNo.localeCompare(b.rollNo))
 
