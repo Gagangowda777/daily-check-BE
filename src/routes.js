@@ -54,6 +54,7 @@ const MESSAGE_TYPES = {
 
 const INBOX_ROLE_LABEL = {
   admin: 'Admin / Coordinator',
+  superadmin: 'Super Admin',
   teacher: 'Class Teacher',
   leader: 'Class Leader',
   transport: 'Transport In-charge',
@@ -65,7 +66,8 @@ const INBOX_TARGETS = {
   leader: ['TEACHER', 'ADMIN', 'ALL'],
   transport: ['ADMIN', 'ALL'],
   gate: ['ADMIN', 'ALL'],
-  admin: ['TEACHER', 'LEADER', 'TRANSPORT', 'GATE', 'ALL'],
+  admin: ['SUPERADMIN', 'TEACHER', 'LEADER', 'TRANSPORT', 'GATE', 'ALL'],
+  superadmin: ['ADMIN', 'TEACHER', 'LEADER', 'ALL'],
 }
 
 const classLabelOf = (grade, section) => `${grade === 'PU1' ? '11' : '12'}${section}`
@@ -161,6 +163,7 @@ export function buildRecordsRouter({
   AuditLog,
   GateLog,
   DailyNote,
+  SectionNc,
 }) {
   const router = express.Router()
 
@@ -1071,11 +1074,15 @@ export function buildRecordsRouter({
   const inboxRoleFor = (role) =>
     role === 'teacher'
       ? 'TEACHER'
-      : role === 'transport'
-        ? 'TRANSPORT'
-        : role === 'gate'
-          ? 'GATE'
-          : 'ADMIN'
+      : role === 'leader'
+        ? 'LEADER'
+        : role === 'transport'
+          ? 'TRANSPORT'
+          : role === 'gate'
+            ? 'GATE'
+            : role === 'superadmin'
+              ? 'SUPERADMIN'
+              : 'ADMIN'
 
   const senderContext = (user) =>
     user.role === 'teacher' || user.role === 'leader'
@@ -1089,11 +1096,14 @@ export function buildRecordsRouter({
     api(async (req, res) => {
       const user = req.user || {}
       const role = user.role || 'admin'
-      const date = String(req.query.date || todayIso())
+      // No date means the whole history: the chat keeps every thread, like a
+      // messaging app, instead of only the selected day's rows.
+      const date = req.query.date ? String(req.query.date) : null
+      const scope = date ? { date } : {}
       const wanted = inboxRoleFor(role)
 
       const direct = await InboxMessage.find({
-        date,
+        ...scope,
         toRole: { $in: [wanted, 'ALL'] },
       })
         .sort({ createdAt: -1 })
@@ -1108,17 +1118,25 @@ export function buildRecordsRouter({
           (doc.grade === user.grade && doc.section === user.section)
       )
 
-      // Reading is per message: a row is only marked read when the user opens
-      // it, so the inbox behaves like a chat list.
-      let unread = visible.filter((doc) => !doc.readAt).length
-      let items = visible.map(inboxRow)
+      // A chat shows both sides of today's conversation: what arrived and what
+      // this role sent. Sending is never counted as unread for the sender.
+      const sent = await InboxMessage.find({ ...scope, fromRole: role }).lean()
+      const byId = new Map(visible.map((doc) => [String(doc._id), doc]))
+      for (const doc of sent) if (!byId.has(String(doc._id))) byId.set(String(doc._id), doc)
+
+      let unread = visible.filter((doc) => !doc.readAt && doc.fromRole !== role).length
+      let items = [...byId.values()].map((doc) => ({
+        ...inboxRow(doc),
+        mine: doc.fromRole === role,
+        toRole: doc.toRole,
+      }))
 
       // The teacher inbox also carries the admin broadcasts and the leader's
       // notes, so one screen shows everything addressed to the class teacher.
       if (role === 'teacher') {
         const [notices, notes] = await Promise.all([
-          TeacherNotice.find({ date, grade: user.grade, section: user.section }).lean(),
-          LeaderNote.find({ date, grade: user.grade, section: user.section }).lean(),
+          TeacherNotice.find({ ...scope, grade: user.grade, section: user.section }).lean(),
+          LeaderNote.find({ ...scope, grade: user.grade, section: user.section }).lean(),
         ])
 
         unread += notices.filter((notice) => !notice.readAt).length
@@ -1147,14 +1165,74 @@ export function buildRecordsRouter({
             body: note.body,
             fromName: note.author,
             fromRole: 'leader',
+            toRole: 'TEACHER',
             fromContext: classLabelOf(user.grade, user.section),
             sentAt: note.sentAt,
             sentAtIst: istClock(note.createdAt),
             readAt: note.readAt || null,
             readBy: note.readBy || null,
             at: note.createdAt ? new Date(note.createdAt).toISOString() : null,
+            mine: false,
           })),
         ]
+
+        // The teacher's own messages to the class leader live on the leader
+        // message row, so they are added back as outgoing bubbles.
+        const teacherSends = await LeaderMessage.find({
+          ...scope,
+          grade: user.grade,
+          section: user.section,
+          sentBy: user.email,
+        }).lean()
+        items = [
+          ...items,
+          ...teacherSends.map((message) => ({
+            id: String(message._id),
+            kind: 'leader',
+            title: message.title,
+            body: message.body || message.title,
+            fromName: message.sender || user.name || 'Class Teacher',
+            fromRole: 'teacher',
+            toRole: 'LEADER',
+            fromContext: classLabelOf(user.grade, user.section),
+            sentAt: message.sentAt,
+            sentAtIst: istClock(message.createdAt),
+            readAt: message.seenAt || message.acknowledgedAt || null,
+            readBy: message.seenBy || message.acknowledgedBy || null,
+            at: message.createdAt ? new Date(message.createdAt).toISOString() : null,
+            mine: true,
+          })),
+        ]
+      }
+
+      // A class leader's chat is the section's leader messages (admin
+      // broadcasts and teacher updates) plus anything the leader sent back.
+      if (role === 'leader') {
+        const leaderDocs = await LeaderMessage.find({
+          ...scope,
+          grade: user.grade,
+          section: user.section,
+        }).lean()
+        items = [
+          ...items,
+          ...leaderDocs.map((message) => ({
+            id: String(message._id),
+            kind: 'leader',
+            title: message.title,
+            body: message.body || message.title,
+            fromName: message.sender || 'Admin / Coordinator',
+            fromRole: message.fromRole === 'teacher' ? 'teacher' : 'admin',
+            toRole: null,
+            fromContext: message.sender || null,
+            sentAt: message.sentAt,
+            sentAtIst: istClock(message.createdAt),
+            readAt: message.seenAt || message.acknowledgedAt || null,
+            readBy: message.seenBy || message.acknowledgedBy || null,
+            at: message.createdAt ? new Date(message.createdAt).toISOString() : null,
+            mine: false,
+          })),
+        ]
+        unread += leaderDocs.filter((message) => !message.seenAt && !message.acknowledgedAt).length
       }
 
       items.sort((a, b) =>
@@ -1252,7 +1330,11 @@ export function buildRecordsRouter({
       if (!allowed.includes(to)) throw httpError(400, 'Choose who should receive this message.')
 
       const body = String(req.body?.body || '').trim()
-      if (body.length < 3) throw httpError(400, 'Write the message you want to send.')
+      // Body can be formatted, so check the visible text, not the markup.
+      const plainBody = body.replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').trim()
+      if (body.length < 3 || plainBody.length < 3) {
+        throw httpError(400, 'Write the message you want to send.')
+      }
       if (body.length > 1000) throw httpError(400, 'Keep the message under 1000 characters.')
 
       const fromName = user.name || INBOX_ROLE_LABEL[role] || 'Daily Check'
@@ -1262,13 +1344,16 @@ export function buildRecordsRouter({
       const day = req.body?.date || todayIso()
       const sentAt = istClock()
       const context = senderContext(user)
-      const targets = to === 'ALL' ? ['ADMIN', 'TRANSPORT', 'GATE'] : [to]
+      const targets =
+        to === 'ALL'
+          ? ['ADMIN', 'SUPERADMIN', 'TEACHER', 'LEADER', 'TRANSPORT', 'GATE']
+          : [to]
 
       let delivered = 0
 
       // A class teacher messaging the leader writes the same row the leader
       // inbox reads, so the daily-check message block is satisfied too.
-      if (targets.includes('LEADER')) {
+      if (to === 'LEADER') {
         await LeaderMessage.create({
           date: day,
           grade: user.grade,
@@ -1276,6 +1361,7 @@ export function buildRecordsRouter({
           title,
           type: 'update',
           target: 'Class Leader',
+          fromRole: role === 'teacher' ? 'teacher' : 'admin',
           sender: fromName,
           sentBy: user.email || null,
           body,
@@ -1286,7 +1372,7 @@ export function buildRecordsRouter({
       }
 
       const docs = targets
-        .filter((target) => target !== 'LEADER')
+        .filter((target) => (to === 'LEADER' ? target !== 'LEADER' : true))
         .map((toRole) => ({
           date: day,
           title,
@@ -1929,6 +2015,42 @@ export function buildRecordsRouter({
           note: record.resolutionNote,
         }))
 
+      const attendance = records
+        .map((record) => ({
+          rollNo: record.rollNo,
+          name: record.name,
+          attendance: record.attendance,
+          ncFlag: Boolean(record.ncFlag),
+          ncReason: record.ncReason || null,
+        }))
+        .sort((a, b) => a.rollNo.localeCompare(b.rollNo))
+
+      const attendanceSummary = {
+        present: attendance.filter((row) => row.attendance === 'present').length,
+        absent: attendance.filter((row) => row.attendance === 'absent').length,
+        late: attendance.filter((row) => row.attendance === 'late').length,
+        nc: attendance.filter((row) => row.ncFlag).length,
+      }
+
+      // Everything the coordinator uploaded for this section today, from both
+      // the exit and entry restriction sheets.
+      const adminRows = [
+        ...exit.map((row) => ({
+          type: 'exit',
+          rollNo: row.rollNo,
+          name: row.name,
+          detail: row.reason || 'Exit restriction',
+          status: row.status,
+        })),
+        ...entry.map((row) => ({
+          type: 'entry',
+          rollNo: row.rollNo,
+          name: row.name,
+          detail: (row.subjects || []).join(', ') || 'All subjects',
+          status: row.handover ? 'handed over' : 'pending',
+        })),
+      ].sort((a, b) => a.rollNo.localeCompare(b.rollNo))
+
       const clock = clockNow()
 
       res.json({
@@ -1942,6 +2064,17 @@ export function buildRecordsRouter({
         exit,
         entry,
         nc: { count: entryDoc?.ncCount ?? null, updatedInNe: Boolean(entryDoc?.updatedInNe) },
+        attendance: { rows: attendance, summary: attendanceSummary },
+        adminData: {
+          rows: adminRows,
+          rowCount: adminRows.length,
+          announcedAt: entryDoc?.adminAnnouncedAt || null,
+          announcedBy: entryDoc?.adminAnnouncedBy || null,
+          announcedCount: entryDoc?.adminAnnouncedCount || 0,
+          acknowledgedAt: entryDoc?.adminAcknowledgedAt || null,
+          acknowledgedBy: entryDoc?.adminAcknowledgedBy || null,
+          acknowledgedCount: entryDoc?.adminAcknowledgedCount || 0,
+        },
         check: { submittedAt: entryDoc?.submittedAt || null },
         message: latestMessage
           ? {
@@ -2293,6 +2426,132 @@ export function buildRecordsRouter({
     })
   )
 
+  // ---- attendance, delayed-with-NC and the admin upload ------------------
+
+  router.post(
+    '/teacher/attendance/:rollNo',
+    api(async (req, res) => {
+      const { grade, section } = needSection(req.body || {})
+      const date = req.body?.date || todayIso()
+      const rollNo = String(req.params.rollNo).toUpperCase()
+      const status = req.body?.status
+      if (!['present', 'absent', 'late'].includes(status)) {
+        throw httpError(400, 'Mark the student present, absent or late.')
+      }
+
+      await ensureToday()
+      const record = await DailyRecord.findOne({ date, grade, section, rollNo }).lean()
+      if (!record) throw httpError(404, 'That student is not in this section today.')
+
+      const nc = Boolean(req.body?.nc)
+      const ncReason = String(req.body?.ncReason || '').trim()
+      if (nc && status !== 'late') {
+        throw httpError(400, 'An NC can only be attached to a delayed arrival.')
+      }
+      if (nc && !ncReason) throw httpError(400, 'Give a short reason for the NC.')
+
+      const withNc = nc && status === 'late'
+      await DailyRecord.updateOne(
+        { date, rollNo },
+        {
+          $set: {
+            attendance: status,
+            ncFlag: withNc,
+            ncReason: withNc ? ncReason : null,
+            ncAt: withNc ? nowClock() : null,
+          },
+        }
+      )
+
+      const teacher = await teacherOf(grade, section)
+      await writeAudit(
+        AuditLog,
+        'Attendance marked',
+        `${rollNo} ${status}${withNc ? ` with NC — ${ncReason}` : ''} by ${teacher} (${section})`
+      )
+      res.json({ ok: true, rollNo, attendance: status, ncFlag: withNc })
+    })
+  )
+
+  // Exactly the rows the teacher page lists: every exit restriction plus the
+  // entry checks that are still pending.
+  const adminUploadRows = async (grade, section, date) =>
+    DailyRecord.countDocuments({
+      date,
+      grade,
+      section,
+      $or: [
+        { restrictionType: 'exit' },
+        { restrictionType: 'entry', resolutionStatus: 'pending' },
+      ],
+    })
+
+  router.post(
+    '/teacher/admin-data/announce',
+    api(async (req, res) => {
+      const { grade, section } = needSection(req.body || {})
+      const date = req.body?.date || todayIso()
+      const uploaded = await adminUploadRows(grade, section, date)
+      if (uploaded === 0) {
+        throw httpError(400, 'The admin has not uploaded anything for this section today.')
+      }
+
+      const teacher = await teacherOf(grade, section)
+      const at = nowClock()
+      await EntrySection.findOneAndUpdate(
+        { date, grade, section },
+        {
+          $set: {
+            adminAnnouncedAt: at,
+            adminAnnouncedBy: teacher,
+            adminAnnouncedCount: uploaded,
+          },
+        },
+        { upsert: true, setDefaultsOnInsert: true }
+      )
+      await writeAudit(
+        AuditLog,
+        'Admin upload announced',
+        `${grade}/${section} — ${uploaded} row(s) by ${teacher}`
+      )
+      res.json({ ok: true, announcedAt: at, announcedBy: teacher })
+    })
+  )
+
+  router.post(
+    '/teacher/admin-data/acknowledge',
+    api(async (req, res) => {
+      const { grade, section } = needSection(req.body || {})
+      const date = req.body?.date || todayIso()
+      const [doc, uploaded] = await Promise.all([
+        EntrySection.findOne({ date, grade, section }).lean(),
+        adminUploadRows(grade, section, date),
+      ])
+      if (uploaded === 0) {
+        throw httpError(400, 'The admin has not uploaded anything for this section today.')
+      }
+      if (!doc?.adminAnnouncedAt || (doc.adminAnnouncedCount || 0) !== uploaded) {
+        throw httpError(400, 'Announce the latest admin upload in class before acknowledging it.')
+      }
+
+      const teacher = await teacherOf(grade, section)
+      const at = nowClock()
+      await EntrySection.findOneAndUpdate(
+        { date, grade, section },
+        {
+          $set: {
+            adminAcknowledgedAt: at,
+            adminAcknowledgedBy: teacher,
+            adminAcknowledgedCount: uploaded,
+          },
+        },
+        { upsert: true, setDefaultsOnInsert: true }
+      )
+      await writeAudit(AuditLog, 'Admin upload acknowledged', `${grade}/${section} by ${teacher}`)
+      res.json({ ok: true, acknowledgedAt: at, acknowledgedBy: teacher })
+    })
+  )
+
   router.post(
     '/teacher/message',
     api(async (req, res) => {
@@ -2310,6 +2569,7 @@ export function buildRecordsRouter({
         title: MESSAGE_TYPES[type],
         type,
         target: 'Class Leader',
+        fromRole: 'teacher',
         sender: await teacherOf(grade, section),
         body:
           type === 'authorized-exit'
@@ -3562,30 +3822,115 @@ export function buildRecordsRouter({
     })
   )
 
-  router.post(
-    '/datasheet/commit',
+  // ---- admin data entry: the workbook's daily sheets ----------------------
+
+  const EXIT_SHEET_STATUSES = ['pending', 'acknowledged', 'absent', 'excused', 'resolved']
+
+  const insertDefaults = (day, student) => ({
+    date: day,
+    student: student._id,
+    rollNo: student.rollNo,
+    name: student.name,
+    grade: student.grade,
+    section: student.section,
+    attendance: 'present',
+    busRoute: student.busRoute,
+    busLate: false,
+  })
+
+  router.get(
+    '/datasheet/:date',
     api(async (req, res) => {
-      const { rows = [], date } = req.body || {}
-      if (!Array.isArray(rows) || rows.length === 0) {
-        throw httpError(400, 'Provide at least one row to commit from the digital sheet.')
+      await ensureToday()
+      const date = req.params.date || todayIso()
+
+      const [records, nc] = await Promise.all([
+        DailyRecord.find({ date, restrictionType: { $in: ['exit', 'entry'] } })
+          .sort({ section: 1, rollNo: 1 })
+          .select(
+            '-_id rollNo name grade section restrictionType restrictionReason ' +
+              'restrictionUntilResolved restrictionEndDate pendingSubjects resolutionStatus resolvedOn'
+          )
+          .lean(),
+        SectionNc
+          ? SectionNc.find({ date }).select('-_id grade section count updatedInNe').lean()
+          : [],
+      ])
+
+      res.json({
+        date,
+        exit: records
+          .filter((row) => row.restrictionType === 'exit')
+          .map((row) => ({
+            ...row,
+            classLabel: classLabelOf(row.grade, row.section),
+            status: row.resolutionStatus,
+          })),
+        entry: records
+          .filter((row) => row.restrictionType === 'entry')
+          .map((row) => ({
+            ...row,
+            classLabel: classLabelOf(row.grade, row.section),
+            subjects: (row.pendingSubjects || []).join(', '),
+          })),
+        nc,
+      })
+    })
+  )
+
+  router.post(
+    '/datasheet/entry',
+    api(async (req, res) => {
+      const { sheet, rows = [], removed = [], date } = req.body || {}
+      if (sheet !== 'exit' && sheet !== 'entry') {
+        throw httpError(400, 'Choose the exit or entry restriction sheet.')
+      }
+      if (!Array.isArray(rows) || !Array.isArray(removed)) {
+        throw httpError(400, 'Rows must be a list.')
       }
 
       const day = date || todayIso()
-      const time = nowClock()
-
-      const rollNos = rows
-        .map((r) => (r.rollNo ? String(r.rollNo).trim().toUpperCase() : ''))
+      const author = req.user?.name || req.user?.email || 'Coordinator'
+      const removedRolls = removed
+        .map((roll) => String(roll || '').trim().toUpperCase())
         .filter(Boolean)
+      const rollNos = [
+        ...rows.map((row) => String(row.rollNo || '').trim().toUpperCase()),
+        ...removedRolls,
+      ].filter(Boolean)
+
+      if (rollNos.length === 0) {
+        throw httpError(400, 'Add at least one roll number to the sheet.')
+      }
 
       const students = await Student.find({ rollNo: { $in: rollNos } }).lean()
-      const studentMap = new Map(students.map((s) => [s.rollNo, s]))
-
-      let appliedCount = 0
+      const studentMap = new Map(students.map((student) => [student.rollNo, student]))
       const errors = []
-      const noteDocs = []
+      let saved = 0
+
+      // A row the coordinator deleted from the sheet is cleared from the
+      // register for that day only; other days keep their history.
+      for (const rollNo of removedRolls) {
+        if (!studentMap.has(rollNo)) continue
+        await DailyRecord.updateOne(
+          { date: day, rollNo, restrictionType: sheet },
+          {
+            $set: {
+              restrictionType: null,
+              restrictionReason: null,
+              restrictionEndDate: null,
+              restrictionUntilResolved: false,
+              pendingSubjects: [],
+              resolutionStatus: 'none',
+              resolvedOn: null,
+            },
+          }
+        )
+        saved += 1
+      }
 
       for (const row of rows) {
-        const rollNo = row.rollNo ? String(row.rollNo).trim().toUpperCase() : ''
+        const rollNo = String(row.rollNo || '').trim().toUpperCase()
         if (!rollNo) continue
 
         const student = studentMap.get(rollNo)
@@ -3594,110 +3939,274 @@ export function buildRecordsRouter({
           continue
         }
 
-        const category = row.category || 'exit_restriction'
-        const detail = String(row.detail || row.reason || 'Noted down').trim()
-
-        if (category === 'exit_restriction') {
+        if (sheet === 'exit') {
+          const status = EXIT_SHEET_STATUSES.includes(row.status) ? row.status : 'pending'
+          const reason = String(row.reason || '').trim() || 'Noted by coordinator'
+          const resolved = status === 'resolved'
           await DailyRecord.findOneAndUpdate(
             { date: day, rollNo },
             {
               $set: {
                 restrictionType: 'exit',
-                restrictionReason: detail || 'Crossed 3 NCs',
-                resolutionStatus: 'pending',
-                restrictionUntilResolved: row.untilResolved !== false,
-                // "Today only" rows still need a concrete end date, otherwise
-                // the register would show a restriction with no expiry at all.
-                restrictionEndDate:
-                  row.untilResolved === false ? row.endDate || day : row.endDate || null,
+                restrictionReason: reason,
+                restrictionUntilResolved: !resolved,
+                restrictionEndDate: null,
+                pendingSubjects: [],
+                resolutionStatus: status,
+                resolvedOn: resolved ? day : null,
               },
-              $setOnInsert: {
-                date: day,
-                student: student._id,
-                rollNo: student.rollNo,
-                name: student.name,
-                grade: student.grade,
-                section: student.section,
-                attendance: 'present',
-                busRoute: student.busRoute,
-                busLate: false,
-              },
+              $setOnInsert: insertDefaults(day, student),
             },
             { upsert: true }
           )
-        } else if (category === 'entry_restriction') {
-          const subs = detail ? detail.split(/[,;/+]+/).map((s) => s.trim()).filter(Boolean) : ['All Subjects']
+        } else {
+          const subjects = String(row.subjects || '')
+            .split(/[,;/+]+/)
+            .map((item) => item.trim())
+            .filter(Boolean)
           await DailyRecord.findOneAndUpdate(
             { date: day, rollNo },
             {
               $set: {
                 restrictionType: 'entry',
-                restrictionReason: subs.join(', '),
-                pendingSubjects: subs,
+                restrictionReason: subjects.length ? subjects.join(', ') : 'All Subjects',
+                pendingSubjects: subjects.length ? subjects : ['All Subjects'],
+                restrictionUntilResolved: false,
+                restrictionEndDate: null,
                 resolutionStatus: 'pending',
+                resolvedOn: null,
               },
-              $setOnInsert: {
-                date: day,
-                student: student._id,
-                rollNo: student.rollNo,
-                name: student.name,
-                grade: student.grade,
-                section: student.section,
-                attendance: 'present',
-                busRoute: student.busRoute,
-                busLate: false,
-              },
-            },
-            { upsert: true }
-          )
-        } else if (category === 'late_arrival') {
-          await DailyRecord.findOneAndUpdate(
-            { date: day, rollNo },
-            {
-              $set: { attendance: 'late' },
-              $setOnInsert: {
-                date: day,
-                student: student._id,
-                rollNo: student.rollNo,
-                name: student.name,
-                grade: student.grade,
-                section: student.section,
-                busRoute: student.busRoute,
-                busLate: false,
-              },
+              $setOnInsert: insertDefaults(day, student),
             },
             { upsert: true }
           )
         }
-
-        noteDocs.push({
-          date: day,
-          time,
-          rollNo: student.rollNo,
-          name: student.name,
-          grade: student.grade,
-          section: student.section,
-          category,
-          content: detail,
-          status: 'applied',
-          author: req.user?.name || req.user?.email || 'Coordinator',
-          appliedAs: category,
-        })
-
-        appliedCount += 1
-      }
-
-      if (DailyNote && noteDocs.length > 0) {
-        await DailyNote.insertMany(noteDocs, { ordered: false })
+        saved += 1
       }
 
       await writeAudit(
         AuditLog,
-        'In-app data sheet commit',
-        `${appliedCount} entry/entries committed directly for ${day}`
+        `Data entry — ${sheet} restriction sheet`,
+        `${saved} row(s) saved for ${day} by ${author}`
       )
 
-      res.json({ ok: true, count: appliedCount, errors })
+      res.json({ ok: true, saved, errors })
+    })
+  )
+
+  router.post(
+    '/datasheet/nc',
+    api(async (req, res) => {
+      if (!SectionNc) throw httpError(503, 'The NC sheet is unavailable.')
+      const { date, rows = [] } = req.body || {}
+      if (!Array.isArray(rows)) throw httpError(400, 'Rows must be a list.')
+
+      const day = date || todayIso()
+      const author = req.user?.name || req.user?.email || 'Coordinator'
+      let saved = 0
+
+      for (const row of rows) {
+        const grade = row.grade === 'PU2' ? 'PU2' : row.grade === 'PU1' ? 'PU1' : null
+        const section = String(row.section || '').trim().toUpperCase()
+        if (!grade || !section) continue
+
+        const count = Math.max(0, Math.floor(Number(row.count) || 0))
+        await SectionNc.findOneAndUpdate(
+          { date: day, grade, section },
+          { $set: { count, updatedInNe: Boolean(row.updatedInNe), author } },
+          { upsert: true, setDefaultsOnInsert: true }
+        )
+        saved += 1
+      }
+
+      await writeAudit(AuditLog, 'Data entry — CC NC sheet', `${saved} section(s) saved for ${day}`)
+      res.json({ ok: true, saved })
+    })
+  )
+
+  // ---- super admin: final approval of the acknowledged upload --------------
+
+  router.get(
+    '/superadmin/today',
+    api(async (req, res) => {
+      await ensureToday()
+      const date = req.query.date || todayIso()
+
+      const [records, groups, docs, sections] = await Promise.all([
+        DailyRecord.find({ date })
+          .select(
+            'grade section rollNo name restrictionType restrictionReason pendingSubjects ' +
+              'resolutionStatus handover attendance ncFlag ncReason'
+          )
+          .lean(),
+        Student.aggregate([
+          { $group: { _id: { grade: '$grade', section: '$section' } } },
+          { $sort: { '_id.section': 1 } },
+        ]),
+        EntrySection.find({ date }).lean(),
+        Section.find({}).select('grade section teacher').lean(),
+      ])
+
+      const teacherBySection = new Map(
+        sections.map((item) => [`${item.grade}:${item.section}`, item.teacher])
+      )
+
+      const bySection = new Map()
+      for (const doc of docs) bySection.set(`${doc.grade}:${doc.section}`, doc)
+
+      const sectionRows = groups.map((group) => {
+        const { grade, section } = group._id
+        const label = classLabelOf(grade, section)
+        const mine = records.filter((row) => row.grade === grade && row.section === section)
+        const doc = bySection.get(`${grade}:${section}`)
+
+        const exit = mine.filter((row) => row.restrictionType === 'exit')
+        const entry = mine.filter(
+          (row) => row.restrictionType === 'entry' && row.resolutionStatus === 'pending'
+        )
+        const adminRows = [
+          ...exit.map((row) => ({
+            type: 'exit',
+            rollNo: row.rollNo,
+            name: row.name,
+            detail: row.restrictionReason || 'Exit restriction',
+            status: row.resolutionStatus,
+          })),
+          ...entry.map((row) => ({
+            type: 'entry',
+            rollNo: row.rollNo,
+            name: row.name,
+            detail: (row.pendingSubjects || []).join(', ') || 'All subjects',
+            status: row.handover ? 'handed over' : 'pending',
+          })),
+        ].sort((a, b) => a.rollNo.localeCompare(b.rollNo))
+
+        const uploaded = adminRows.length
+        const acknowledged = Boolean(doc?.adminAcknowledgedAt) && (doc?.adminAcknowledgedCount || 0) === uploaded
+        const ncStudents = mine
+          .filter((row) => row.ncFlag)
+          .map((row) => ({ rollNo: row.rollNo, name: row.name, reason: row.ncReason || 'Delayed arrival' }))
+
+        return {
+          grade,
+          section,
+          label,
+          teacher: teacherBySection.get(`${grade}:${section}`) || null,
+          adminRows,
+          rowCount: uploaded,
+          teacherAcknowledged: acknowledged,
+          acknowledgedAt: doc?.adminAcknowledgedAt || null,
+          acknowledgedBy: doc?.adminAcknowledgedBy || null,
+          ncCount: doc?.ncCount ?? null,
+          updatedInNe: Boolean(doc?.updatedInNe),
+          ncStudents,
+          attendance: {
+            present: mine.filter((row) => row.attendance === 'present').length,
+            absent: mine.filter((row) => row.attendance === 'absent').length,
+            late: mine.filter((row) => row.attendance === 'late').length,
+          },
+          finalStatus: doc?.finalStatus || 'pending',
+          finalAt: doc?.finalAt || null,
+          finalBy: doc?.finalBy || null,
+          finalNote: doc?.finalNote || null,
+          ncDeducted: doc?.ncDeducted || 0,
+          ready: uploaded > 0 && acknowledged,
+        }
+      })
+
+      // Work first: sections the teacher has acknowledged but nobody approved yet.
+      sectionRows.sort((a, b) => {
+        const weight = (row) =>
+          row.finalStatus === 'approved' ? 2 : row.ready ? 0 : 1
+        return weight(a) - weight(b) || a.label.localeCompare(b.label)
+      })
+
+      res.json({
+        date,
+        sections: sectionRows,
+        summary: {
+          total: sectionRows.length,
+          withUploads: sectionRows.filter((row) => row.rowCount > 0).length,
+          awaitingTeacher: sectionRows.filter((row) => row.rowCount > 0 && !row.teacherAcknowledged).length,
+          ready: sectionRows.filter((row) => row.ready && row.finalStatus !== 'approved').length,
+          approved: sectionRows.filter((row) => row.finalStatus === 'approved').length,
+          ncDeducted: sectionRows.reduce((sum, row) => sum + (row.ncDeducted || 0), 0),
+        },
+      })
+    })
+  )
+
+  router.post(
+    '/superadmin/approve',
+    api(async (req, res) => {
+      const grade = req.body?.grade === 'PU2' ? 'PU2' : req.body?.grade === 'PU1' ? 'PU1' : null
+      const section = String(req.body?.section || '').trim().toUpperCase()
+      if (!grade || !section) throw httpError(400, 'Pick the section to approve.')
+      const date = req.body?.date || todayIso()
+
+      const doc = await EntrySection.findOne({ date, grade, section }).lean()
+      if (!doc?.adminAcknowledgedAt) {
+        throw httpError(400, 'The class teacher has not acknowledged the upload yet.')
+      }
+      if (doc.finalStatus === 'approved') {
+        throw httpError(400, 'This section is already approved for today.')
+      }
+
+      const uploaded = await DailyRecord.countDocuments({
+        date,
+        grade,
+        section,
+        $or: [
+          { restrictionType: 'exit' },
+          { restrictionType: 'entry', resolutionStatus: 'pending' },
+        ],
+      })
+      if (uploaded === 0) throw httpError(400, 'Nothing was uploaded for this section today.')
+      if ((doc.adminAcknowledgedCount || 0) !== uploaded) {
+        throw httpError(400, 'The class teacher must acknowledge the latest upload before approval.')
+      }
+
+      const ncCount = doc.ncCount ?? 0
+      const deduct = Boolean(req.body?.deductNc)
+      let deductCount = 0
+      if (deduct && ncCount > 0) {
+        deductCount = Math.floor(Number(req.body?.deductCount) || 0)
+        if (deductCount < 1 || deductCount > ncCount) {
+          throw httpError(400, `Deduct between 1 and ${ncCount} NC(s).`)
+        }
+      }
+
+      const at = nowClock()
+      const by = req.user?.email || 'Super Admin'
+      const patch = {
+        finalStatus: 'approved',
+        finalAt: at,
+        finalBy: by,
+        finalNote: String(req.body?.note || '').trim() || null,
+        ncDeducted: deductCount,
+        ncDeductedAt: deductCount ? at : null,
+      }
+      if (deductCount) patch.ncCount = Math.max(0, ncCount - deductCount)
+
+      await EntrySection.findOneAndUpdate(
+        { date, grade, section },
+        { $set: patch },
+        { upsert: true, setDefaultsOnInsert: true }
+      )
+
+      await writeAudit(
+        AuditLog,
+        'Final approval',
+        `${grade}/${section} approved for ${date}${deductCount ? ` — ${deductCount} NC(s) deducted` : ''}`
+      )
+
+      res.json({
+        ok: true,
+        finalStatus: 'approved',
+        finalAt: at,
+        ncCount: patch.ncCount ?? ncCount,
+        ncDeducted: deductCount,
+      })
     })
   )
 

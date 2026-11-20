@@ -16,6 +16,8 @@ const leaderMessageSchema = new mongoose.Schema(
     },
     target: { type: String, default: 'Whole School' },
     sender: { type: String, default: null }, // who sent it
+    // Which dashboard sent it: admin broadcasts vs a class teacher's own note.
+    fromRole: { type: String, enum: ['admin', 'teacher'], default: 'admin' },
     sentBy: { type: String, default: null }, // signed-in admin account email
     batchId: { type: String, default: null, index: true }, // one broadcast across sections
     body: { type: String, default: null }, // message text

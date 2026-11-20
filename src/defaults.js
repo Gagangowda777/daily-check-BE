@@ -25,6 +25,7 @@ export const DEFAULT_ENTRY_SUBJECTS = [
 export const DEFAULT_BUS_CUTOFF = '08:20'
 
 export const ROLE_LABELS = {
+  superadmin: 'Super Admin',
   admin: 'Admin / Coordinator',
   teacher: 'Class Teacher',
   transport: 'Transport In-charge',

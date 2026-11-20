@@ -38,6 +38,23 @@ async function materialize({ Student, DailyRecord, BusLog }, date) {
   const missing = students.filter((student) => !seen.has(String(student._id)))
 
   if (missing.length > 0) {
+    // An absence carries forward day after day until the class teacher marks
+    // the student present again, so read each student's latest attendance
+    // before today and reuse it when it was "absent".
+    const previous = await DailyRecord.aggregate([
+      {
+        $match: {
+          rollNo: { $in: missing.map((student) => student.rollNo) },
+          date: { $lt: date },
+        },
+      },
+      { $sort: { date: -1 } },
+      { $group: { _id: '$rollNo', attendance: { $first: '$attendance' } } },
+    ])
+    const carriedAbsent = new Set(
+      previous.filter((row) => row.attendance === 'absent').map((row) => row._id)
+    )
+
     await safeBulkWrite(
       DailyRecord,
       missing.map((student) => ({
@@ -51,7 +68,7 @@ async function materialize({ Student, DailyRecord, BusLog }, date) {
               name: student.name,
               grade: student.grade,
               section: student.section,
-              attendance: 'present',
+              attendance: carriedAbsent.has(student.rollNo) ? 'absent' : 'present',
               busRoute: student.busRoute,
               busLate: false,
               rider: true,

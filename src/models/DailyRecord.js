@@ -19,6 +19,10 @@ const dailyRecordSchema = new mongoose.Schema(
     },
     busRoute: { type: String, default: null },
     busLate: { type: Boolean, default: false },
+    // A delayed arrival the class teacher marked with an NC.
+    ncFlag: { type: Boolean, default: false },
+    ncReason: { type: String, default: null },
+    ncAt: { type: String, default: null },
     // Cleared when the transport desk unticks a student who is not riding.
     rider: { type: Boolean, default: true },
 

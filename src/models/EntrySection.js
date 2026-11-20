@@ -10,6 +10,27 @@ const entrySectionSchema = new mongoose.Schema(
     // Daily NC tracker entered by the class teacher.
     ncCount: { type: Number, default: null },
     updatedInNe: { type: Boolean, default: false },
+    // The class teacher announced the admin's uploaded rows in class and then
+    // acknowledged receiving them.
+    adminAnnouncedAt: { type: String, default: null },
+    adminAnnouncedBy: { type: String, default: null },
+    adminAnnouncedCount: { type: Number, default: 0 },
+    adminAcknowledgedAt: { type: String, default: null },
+    adminAcknowledgedBy: { type: String, default: null },
+    adminAcknowledgedCount: { type: Number, default: 0 },
+    // Super admin's final sign-off on the acknowledged upload.
+    finalStatus: {
+      type: String,
+      required: true,
+      enum: ['pending', 'approved', 'rejected'],
+      default: 'pending',
+    },
+    finalAt: { type: String, default: null },
+    finalBy: { type: String, default: null },
+    finalNote: { type: String, default: null },
+    // NCs the super admin chose to deduct when approving this day.
+    ncDeducted: { type: Number, default: 0 },
+    ncDeductedAt: { type: String, default: null },
   },
   { timestamps: true }
 )

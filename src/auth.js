@@ -164,6 +164,7 @@ export function authorize(req, res, next) {
   }
 
   const allowed =
+    (role === 'superadmin' && path.startsWith('/superadmin/')) ||
     (role === 'teacher' && path.startsWith('/teacher/')) ||
     (role === 'transport' && path.startsWith('/transport/')) ||
     (role === 'leader' &&

@@ -12,7 +12,7 @@ const inboxMessageSchema = new mongoose.Schema(
     fromRole: {
       type: String,
       required: true,
-      enum: ['admin', 'teacher', 'leader', 'transport', 'gate'],
+      enum: ['admin', 'superadmin', 'teacher', 'leader', 'transport', 'gate'],
     },
     fromName: { type: String, required: true },
     fromEmail: { type: String, default: null },
@@ -20,7 +20,7 @@ const inboxMessageSchema = new mongoose.Schema(
     toRole: {
       type: String,
       required: true,
-      enum: ['ADMIN', 'TEACHER', 'TRANSPORT', 'GATE', 'ALL'],
+      enum: ['ADMIN', 'SUPERADMIN', 'TEACHER', 'LEADER', 'TRANSPORT', 'GATE', 'ALL'],
       index: true,
     },
     grade: { type: String, default: null }, // only for TEACHER / LEADER targets
