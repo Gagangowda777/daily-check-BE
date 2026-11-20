@@ -2193,6 +2193,7 @@ export function buildRecordsRouter({
           name: record.name,
           attendance: record.attendance,
           ncFlag: Boolean(record.ncFlag),
+          ncCount: Number(record.ncCount) || (record.ncFlag ? 1 : 0),
           ncReason: record.ncReason || null,
         }))
         .sort((a, b) => a.rollNo.localeCompare(b.rollNo))
@@ -2626,13 +2627,21 @@ export function buildRecordsRouter({
       }
       if (nc && !ncReason) throw httpError(400, 'Give a short reason for the NC.')
 
-      const withNc = nc && status === 'late'
+      const rawNcCount = Number(req.body?.ncCount)
+      const ncCount =
+        nc && status === 'late'
+          ? Number.isFinite(rawNcCount) && rawNcCount > 0
+            ? Math.min(99, Math.round(rawNcCount))
+            : 1
+          : 0
+      const withNc = ncCount > 0
       await DailyRecord.updateOne(
         { date, rollNo },
         {
           $set: {
             attendance: status,
             ncFlag: withNc,
+            ncCount,
             ncReason: withNc ? ncReason : null,
             ncAt: withNc ? nowClock() : null,
           },
@@ -2643,9 +2652,9 @@ export function buildRecordsRouter({
       await writeAudit(
         AuditLog,
         'Attendance marked',
-        `${rollNo} ${status}${withNc ? ` with NC: ${ncReason}` : ''} by ${teacher} (${section})`
+        `${rollNo} ${status}${withNc ? ` with ${ncCount} NC(s): ${ncReason}` : ''} by ${teacher} (${section})`
       )
-      res.json({ ok: true, rollNo, attendance: status, ncFlag: withNc })
+      res.json({ ok: true, rollNo, attendance: status, ncFlag: withNc, ncCount })
     })
   )
 
@@ -4338,7 +4347,7 @@ export function buildRecordsRouter({
         DailyRecord.find({ date })
           .select(
             'grade section rollNo name restrictionType restrictionReason pendingSubjects ' +
-              'resolutionStatus handover attendance ncFlag ncReason'
+              'resolutionStatus handover attendance ncFlag ncCount ncReason'
           )
           .lean(),
         Student.aggregate([
@@ -4387,7 +4396,12 @@ export function buildRecordsRouter({
         const acknowledged = Boolean(doc?.adminAcknowledgedAt) && (doc?.adminAcknowledgedCount || 0) === uploaded
         const ncStudents = mine
           .filter((row) => row.ncFlag)
-          .map((row) => ({ rollNo: row.rollNo, name: row.name, reason: row.ncReason || 'Delayed arrival' }))
+          .map((row) => ({
+            rollNo: row.rollNo,
+            name: row.name,
+            reason: row.ncReason || 'Delayed arrival',
+            count: Number(row.ncCount) || 1,
+          }))
 
         return {
           grade,
@@ -4469,42 +4483,68 @@ export function buildRecordsRouter({
         throw httpError(400, 'The class teacher must acknowledge the latest upload before approval.')
       }
 
-      // The super admin can forgive an NC student by student. Each reduced
-      // student clears their own flag and lowers the section count by one.
+      // The super admin can forgive NCs student by student. A student may
+      // carry more than one, so each entry names the student and the amount.
       const ncCount = doc.ncCount ?? null
-      const rawRollNos = Array.isArray(req.body?.reduceRollNos) ? req.body.reduceRollNos : []
-      const reduceRollNos = [
-        ...new Set(rawRollNos.map((value) => String(value || '').trim()).filter(Boolean)),
-      ]
+      const legacyRollNos = Array.isArray(req.body?.reduceRollNos) ? req.body.reduceRollNos : []
+      const rawReductions = Array.isArray(req.body?.reduceNcs)
+        ? req.body.reduceNcs
+        : legacyRollNos.map((rollNo) => ({ rollNo, count: 1 }))
+
+      const byRollNo = new Map()
+      for (const entry of rawReductions) {
+        const rollNo = String(entry?.rollNo || entry || '').trim().toUpperCase()
+        const count = Math.floor(Number(entry?.count ?? 1))
+        if (!rollNo || !Number.isFinite(count) || count < 1) continue
+        byRollNo.set(rollNo, (byRollNo.get(rollNo) || 0) + count)
+      }
+      const reductions = [...byRollNo.entries()].map(([rollNo, count]) => ({ rollNo, count }))
+      const reducedRollNos = reductions.map((item) => item.rollNo)
       let reduceCount = 0
 
-      if (reduceRollNos.length) {
+      if (reductions.length) {
         const flagged = await DailyRecord.find({
           date,
           grade,
           section,
-          rollNo: { $in: reduceRollNos },
+          rollNo: { $in: reducedRollNos },
           ncFlag: true,
         })
-          .select('rollNo')
+          .select('rollNo ncCount')
           .lean()
-        const flaggedSet = new Set(flagged.map((row) => row.rollNo))
-        const missing = reduceRollNos.filter((rollNo) => !flaggedSet.has(rollNo))
+        const flaggedByRoll = new Map(
+          flagged.map((row) => [row.rollNo, Number(row.ncCount) || 1])
+        )
+        const missing = reducedRollNos.filter((rollNo) => !flaggedByRoll.has(rollNo))
         if (missing.length) {
           throw httpError(400, `These students have no NC today: ${missing.join(', ')}.`)
         }
-        if (ncCount !== null && reduceRollNos.length > ncCount) {
+        for (const { rollNo, count } of reductions) {
+          const available = flaggedByRoll.get(rollNo)
+          if (count > available) {
+            throw httpError(
+              400,
+              `${rollNo} has only ${available} NC(s), so ${count} cannot be reduced.`
+            )
+          }
+        }
+        reduceCount = reductions.reduce((sum, item) => sum + item.count, 0)
+        if (ncCount !== null && reduceCount > ncCount) {
           throw httpError(
             400,
-            `Only ${ncCount} NC(s) are recorded, so ${reduceRollNos.length} cannot be reduced.`
+            `Only ${ncCount} NC(s) are recorded, so ${reduceCount} cannot be reduced.`
           )
         }
 
-        await DailyRecord.updateMany(
-          { date, grade, section, rollNo: { $in: reduceRollNos } },
-          { $set: { ncFlag: false, ncReason: null, ncAt: null } }
-        )
-        reduceCount = reduceRollNos.length
+        for (const { rollNo, count } of reductions) {
+          const remaining = (flaggedByRoll.get(rollNo) || 1) - count
+          await DailyRecord.updateOne(
+            { date, grade, section, rollNo },
+            remaining > 0
+              ? { $set: { ncCount: remaining } }
+              : { $set: { ncFlag: false, ncCount: 0, ncReason: null, ncAt: null } }
+          )
+        }
       }
 
       const at = nowClock()
@@ -4516,7 +4556,7 @@ export function buildRecordsRouter({
         finalNote: String(req.body?.note || '').trim() || null,
         ncDeducted: reduceCount,
         ncDeductedAt: reduceCount ? at : null,
-        ncReducedRollNos: reduceRollNos,
+        ncReducedRollNos: reducedRollNos,
       }
       if (reduceCount && ncCount !== null) {
         patch.ncCount = Math.max(0, ncCount - reduceCount)
@@ -4532,7 +4572,11 @@ export function buildRecordsRouter({
         AuditLog,
         'Final approval',
         `${grade}/${section} approved for ${date}` +
-          (reduceCount ? `: ${reduceCount} NC(s) reduced (${reduceRollNos.join(', ')})` : '')
+          (reduceCount
+            ? `: ${reduceCount} NC(s) reduced (${reductions
+                .map((item) => (item.count > 1 ? `${item.rollNo} x${item.count}` : item.rollNo))
+                .join(', ')})`
+            : '')
       )
 
       res.json({
@@ -4542,7 +4586,7 @@ export function buildRecordsRouter({
         ncCount: patch.ncCount ?? ncCount,
         ncDeducted: reduceCount,
         ncReduced: reduceCount,
-        ncReducedRollNos: reduceRollNos,
+        ncReducedRollNos: reducedRollNos,
       })
     })
   )
